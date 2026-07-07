@@ -1830,6 +1830,36 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+void ggml_backend_sched_share_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
+    if (!dst || !src) return;
+    const int n = std::min(dst->n_backends, src->n_backends);
+    for (int i = 0; i < n; ++i) {
+        if (dst->bufts[i] != src->bufts[i]) continue;
+        struct vbuffer * src_buf = ggml_gallocr_get_buffer(src->galloc, i);
+        if (!src_buf) continue;
+        struct vbuffer * old_buf = ggml_gallocr_get_buffer(dst->galloc, i);
+        if (old_buf && old_buf != src_buf && !ggml_gallocr_is_borrowed(dst->galloc, i)) {
+            ggml_gallocr_free_buffer(old_buf);
+        }
+        ggml_gallocr_set_buffer(dst->galloc, i, src_buf);
+        ggml_gallocr_set_borrowed(dst->galloc, i, true);
+    }
+}
+
+void ggml_backend_sched_clear_buffers(ggml_backend_sched_t sched) {
+    if (!sched) return;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        struct vbuffer * buf = ggml_gallocr_get_buffer(sched->galloc, i);
+        if (buf) {
+            if (!ggml_gallocr_is_borrowed(sched->galloc, i)) {
+                ggml_gallocr_free_buffer(buf);
+            }
+            ggml_gallocr_set_buffer(sched->galloc, i, nullptr);
+        }
+        ggml_gallocr_set_borrowed(sched->galloc, i, false);
+    }
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);

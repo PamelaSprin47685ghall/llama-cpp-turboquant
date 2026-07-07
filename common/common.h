@@ -518,6 +518,8 @@ struct common_params {
                                      //                                       (which is more convenient to use for plotting)
                                      //
     bool   hellaswag        = false; // compute HellaSwag score over random tasks from datafile supplied in prompt
+
+    struct llama_context * share_compute_buffers_with = nullptr;
     size_t hellaswag_tasks  = 400;   // number of tasks to use when computing the HellaSwag score
 
     bool   winogrande       = false; // compute Winogrande score over random tasks from datafile supplied in prompt
