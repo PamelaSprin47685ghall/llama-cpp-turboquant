@@ -2877,6 +2877,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+bool llama_kv_cache_context::has_layer(int32_t il) const {
+    return kv && kv->has_layer(il);
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2914,11 +2918,13 @@ ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+    if (!kv || !kv->has_layer(il)) return k_cur;
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos.at(i_cur));
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+    if (!kv || !kv->has_layer(il)) return v_cur;
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos.at(i_cur));
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2963,4 +2969,8 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+bool llama_kv_cache::has_layer(int32_t il) const {
+    return map_layer_ids.count(il) > 0;
 }

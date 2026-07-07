@@ -26,7 +26,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    const auto n_kv     = mctx ? mctx->get_n_kv() : 0;
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -45,6 +45,7 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
+    if (!mctx) return false;
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
@@ -497,8 +498,22 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+static const llama_kv_cache_context * get_kv_cache_context(const llama_memory_context_i * mctx, const llm_arch arch) {
+    if (!mctx) return nullptr;
+    if (mctx->get_status() == LLAMA_MEMORY_STATUS_FAILED_PREPARE) return nullptr;
+    const auto * mctx_hyb = dynamic_cast<const llama_memory_hybrid_context *>(mctx);
+    if (mctx_hyb) {
+        return mctx_hyb->get_attn();
+    }
+    const auto * mctx_kv = dynamic_cast<const llama_kv_cache_context *>(mctx);
+    if (mctx_kv) {
+        return mctx_kv;
+    }
+    return nullptr;
+}
+
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    const auto * mctx = get_kv_cache_context(params.mctx, params.arch);
 
     this->mctx = mctx;
 
@@ -2306,21 +2321,21 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
-        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
-        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        inp->self_k_idxs = mctx_cur ? mctx_cur->build_input_k_idxs(ctx0, ubatch) : ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_tokens);
+        inp->self_v_idxs = mctx_cur ? mctx_cur->build_input_v_idxs(ctx0, ubatch) : ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_tokens);
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
-    inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
-    inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+    inp->self_k_rot = mctx_cur ? mctx_cur->build_input_k_rot(ctx0) : nullptr;
+    inp->self_v_rot = mctx_cur ? mctx_cur->build_input_v_rot(ctx0) : nullptr;
 
     return inp;
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+    const auto * mctx_cur = get_kv_cache_context(mctx, arch);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
@@ -2365,15 +2380,20 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        if (mctx_cur) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        } else {
+            ggml_build_forward_expand(gf, k_cur);
+            ggml_build_forward_expand(gf, v_cur);
+        }
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = (mctx_cur && mctx_cur->has_layer(il)) ? mctx_cur->get_k(ctx0, il) : k_cur;
+    ggml_tensor * v = (mctx_cur && mctx_cur->has_layer(il)) ? mctx_cur->get_v(ctx0, il) : v_cur;
 
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens)
@@ -2463,7 +2483,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 }
 
 llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+    const auto * mctx_cur = get_kv_cache_context(mctx, arch);
 
     auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
@@ -2496,13 +2516,17 @@ ggml_tensor * llm_graph_context::build_attn(
     {
         const auto & k_idxs = inp->get_k_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        if (mctx_cur) {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        } else {
+            ggml_build_forward_expand(gf, k_cur);
+        }
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = (mctx_cur && mctx_cur->has_layer(il)) ? mctx_cur->get_k(ctx0, il) : k_cur;
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     // TurboQuant: pre-rotate Q for K-only (MLA) attention
@@ -2514,7 +2538,7 @@ ggml_tensor * llm_graph_context::build_attn(
             q = ggml_pad(ctx0, q, pad, 0, 0, 0);
         }
         if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
-        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        ggml_tensor * innerq_scale = mctx_cur ? mctx_cur->get_turbo_innerq_scale_inv() : nullptr;
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
     }
 

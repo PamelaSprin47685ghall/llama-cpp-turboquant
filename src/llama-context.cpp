@@ -90,6 +90,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    cparams.share_compute_buffers_with = params.share_compute_buffers_with;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -434,6 +435,9 @@ llama_context::~llama_context() {
             }
         }
     }
+    if (cparams.share_compute_buffers_with != nullptr) {
+        ggml_backend_sched_clear_buffers(sched.get());
+    }
     ggml_opt_free(opt_ctx);
 }
 
@@ -461,6 +465,10 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    if (cparams.share_compute_buffers_with != nullptr) {
+        ggml_backend_sched_share_buffers(sched.get(), cparams.share_compute_buffers_with->get_sched());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -621,6 +629,16 @@ void llama_context::sched_reserve() {
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
+            }
+        }
+
+        if (model.hparams.n_layer_nextn > 0 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const auto saved_ctx_type = cparams.ctx_type;
+            cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            auto * gf_mtp = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+            cparams.ctx_type = saved_ctx_type;
+            if (!gf_mtp) {
+                throw std::runtime_error("failed to allocate compute MTP buffers");
             }
         }
 

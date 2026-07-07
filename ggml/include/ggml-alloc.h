@@ -72,6 +72,12 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+struct vbuffer;
+GGML_API struct vbuffer * ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id);
+GGML_API void             ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id, struct vbuffer * buffer);
+GGML_API void             ggml_gallocr_free_buffer(struct vbuffer * buffer);
+GGML_API void             ggml_gallocr_set_borrowed(ggml_gallocr_t galloc, int buffer_id, bool borrowed);
+GGML_API bool             ggml_gallocr_is_borrowed(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

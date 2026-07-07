@@ -482,6 +482,7 @@ struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
+    bool * is_borrowed; // [n_buffers]
     int n_buffers;
 
     struct ggml_hash_set hash_set;
@@ -506,6 +507,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->is_borrowed = calloc(n_bufs, sizeof(bool));
+    GGML_ASSERT(galloc->is_borrowed != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -550,7 +554,9 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
                 }
             }
             if (!freed) {
-                ggml_vbuffer_free(galloc->buffers[i]);
+                if (!galloc->is_borrowed || !galloc->is_borrowed[i]) {
+                    ggml_vbuffer_free(galloc->buffers[i]);
+                }
             }
         }
         if (galloc->buf_tallocs != NULL) {
@@ -573,6 +579,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->is_borrowed);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -1096,6 +1103,20 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     return true;
 }
 
+struct vbuffer * ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    return galloc->buffers[buffer_id];
+}
+
+void ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id, struct vbuffer * buffer) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    galloc->buffers[buffer_id] = buffer;
+}
+
+void ggml_gallocr_free_buffer(struct vbuffer * buffer) {
+    ggml_vbuffer_free(buffer);
+}
+
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 
@@ -1245,4 +1266,14 @@ ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_conte
 
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
     return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+}
+
+void ggml_gallocr_set_borrowed(ggml_gallocr_t galloc, int buffer_id, bool borrowed) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    galloc->is_borrowed[buffer_id] = borrowed;
+}
+
+bool ggml_gallocr_is_borrowed(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    return galloc->is_borrowed ? galloc->is_borrowed[buffer_id] : false;
 }

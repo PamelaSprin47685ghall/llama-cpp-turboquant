@@ -54,4 +54,5 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+    llama_context * share_compute_buffers_with;
 };

@@ -212,6 +212,8 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    bool has_layer(int32_t il) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -376,6 +378,8 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    bool has_layer(int32_t il) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
