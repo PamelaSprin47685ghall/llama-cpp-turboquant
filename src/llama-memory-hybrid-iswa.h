@@ -58,6 +58,13 @@ public:
 
     bool get_can_shift() const override;
 
+    void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
+    void transcode_to_tg(void * stream) override;
+    void dkvt_bind_pp() override;
+    void dkvt_reset() override { if (mem_attn) mem_attn->dkvt_reset(); }
+
+    bool get_is_transcoded_tg() const override { return mem_attn ? mem_attn->get_is_transcoded_tg() : false; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -82,6 +89,8 @@ public:
 
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+
+    llama_kv_cache * as_kv_cache() override { return mem_attn ? mem_attn->get_base() : nullptr; }
 
 private:
     const llama_hparams & hparams;

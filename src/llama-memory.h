@@ -10,9 +10,12 @@
 struct llama_ubatch;
 
 class llama_batch_allocr;
+class llama_kv_cache_context;
 
 class llama_io_write_i;
 class llama_io_read_i;
+
+class llama_kv_cache;
 
 struct llama_memory_params {
     // kv cache
@@ -73,6 +76,10 @@ struct llama_memory_context_i {
     // TurboQuant InnerQ: get per-channel scale_inv tensor for Q/V equalization
     // Returns nullptr when InnerQ is not active. Override in KV cache contexts.
     virtual ggml_tensor * get_turbo_innerq_scale_inv() const { return nullptr; }
+
+    // Polymorphic accessor for KV cache context without dynamic_cast.
+    // Returns the llama_kv_cache_context if this object is/has one, else nullptr.
+    virtual const llama_kv_cache_context * as_kv_cache_context() const { return nullptr; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -109,6 +116,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // return the primary llama_kv_cache instance if this memory manages one, else nullptr
+    virtual llama_kv_cache * as_kv_cache() { return nullptr; }
+
     //
     // ops
     //
@@ -126,6 +136,21 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // DKVT: initialize the union block and bind PP-stage pointers
+    virtual void init_dkvt(size_t /*n_ubatch*/, ggml_backend_sched_t /*sched*/) {}
+
+    // DKVT: transcode turbo KV to mixed precision for TG stage
+    virtual void transcode_to_tg(void * /*stream*/) {}
+
+    // DKVT: reset layout pointers back to PP (turbo) layout after clear() or secondary prefill
+    virtual void dkvt_bind_pp() {}
+
+    // DKVT: full reset — clear transcoded flag and rebind PP layout
+    virtual void dkvt_reset() {}
+
+    // DKVT: query whether transcode to TG-stage mixed precision has completed
+    virtual bool get_is_transcoded_tg() const { return false; }
 
     //
     // state write/read

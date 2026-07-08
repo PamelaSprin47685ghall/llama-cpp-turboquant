@@ -125,12 +125,9 @@ int llama_server(int argc, char ** argv) {
             params.n_batch = params.n_ubatch;
         }
 
-        if (params.n_parallel < 0) {
-            SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
-
-            params.n_parallel = 4;
-            params.kv_unified = true;
-        }
+        // 动态 KV 转码 (DKVT)：在极限制约下强制锁定单会话独占 slots 数量为 1
+        params.n_parallel = 1;
+        params.kv_unified = true;
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

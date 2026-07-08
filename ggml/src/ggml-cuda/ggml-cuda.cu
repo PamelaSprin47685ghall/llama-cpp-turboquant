@@ -98,9 +98,10 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     int id = -1; // in case cudaGetDevice fails
     (void)cudaGetDevice(&id);
 
-    GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
-    GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
-    GGML_LOG_ERROR("  %s\n", stmt);
+    fprintf(stderr, "CUDA error: %s\n", msg);
+    fprintf(stderr, "  current device: %d, in function %s at %s:%d\n", id, func, file, line);
+    fprintf(stderr, "  %s\n", stmt);
+    fflush(stderr);
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
@@ -3545,6 +3546,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
+    if (getenv("GGML_CUDA_NO_GRAPHS") != nullptr) {
+        return false;
+    }
+
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
@@ -3553,6 +3558,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
+        }
+
+        if (node->op == GGML_OP_TURBO_WHT) {
+            use_cuda_graph = false; // Turbo WHT kernel is incompatible with CUDA graph capture
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GGML_OP_TURBO_WHT node\n", __func__);
+#endif
         }
 
         if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
@@ -5113,6 +5125,14 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+extern "C" void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (backend && ggml_backend_is_cuda(backend)) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+        return (void *)cuda_ctx->stream();
+    }
+    return nullptr;
+}
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -6027,6 +6047,15 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     return cuda_backend;
+}
+
+extern "C" bool ggml_cuda_get_mem_info(size_t * free, size_t * total) {
+    size_t f, t;
+    cudaError_t err = cudaMemGetInfo(&f, &t);
+    if (err != cudaSuccess) return false;
+    if (free)  *free  = f;
+    if (total) *total = t;
+    return true;
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

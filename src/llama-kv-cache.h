@@ -114,7 +114,13 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share);
 
-    ~llama_kv_cache() = default;
+    void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
+
+    bool get_is_transcoded_tg() const override { return other ? other->get_is_transcoded_tg() : is_transcoded_tg; }
+
+    llama_kv_cache * as_kv_cache() override { return this; }
+
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -180,6 +186,7 @@ public:
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const { return turbo_innerq_scale_inv; }
 
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -239,6 +246,20 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // Original (PP-stage) types, preserved for DKVT stride/size recalculation
+        ggml_type orig_type_k;
+        ggml_type orig_type_v;
+
+        // DKVT layout caches: byte offsets and sizes for each stage
+        size_t k_offset_pp;
+        size_t v_offset_pp;
+        size_t k_offset_tg;
+        size_t v_offset_tg;
+        size_t k_size_pp;
+        size_t v_size_pp;
+        size_t k_size_tg;
+        size_t v_size_tg;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -290,6 +311,22 @@ private:
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 
+    bool is_transcoded_tg = false;
+
+    size_t size_act_pp = 0;
+    size_t size_act_tg = 0;
+
+    // 动态 KV 转码 (DKVT) 终极双向对撞式成员
+    ggml_backend_buffer_t vram_union_block = nullptr;
+    char * ptr_start = nullptr;
+    char * ptr_end = nullptr;
+    size_t union_size = 0;
+    bool owns_union_block = false;
+    size_t dkvt_k_size_pp = 0;
+    size_t dkvt_k_size_tg = 0;
+    size_t dkvt_v_size_pp = 0;
+    size_t dkvt_v_size_tg = 0;
+
     std::vector<kv_layer> layers;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
@@ -333,6 +370,31 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    // DKVT private helpers for decomposition
+    void init_dkvt_borrow();
+    bool init_dkvt_find_backend(ggml_backend_sched_t sched, ggml_backend_buffer_type_t & buft, int & buffer_id);
+    void init_dkvt_sum_kv_sizes();
+    bool init_dkvt_alloc(ggml_backend_buffer_type_t buft);
+    void init_dkvt_bind_layers(ggml_backend_sched_t sched, int buffer_id);
+    void init_dkvt_compute_activation_size(size_t n_ubatch);
+
+    void transcode_to_tg_cuda(void * stream);
+    void transcode_to_tg_cuda_k(const char * k_src_base, char * k_dst_base, void * stream);
+    void transcode_to_tg_cuda_v(const char * v_src_base, char * v_dst_base, void * stream);
+    void transcode_to_tg_cpu();
+    void dkvt_bind_tg();
+
+    friend int test_companion_offset_sync();
+    friend int test_mtp_child_inherits_parent_kv();
+    friend int test_dkvt_clear_resets_layout();
+    friend int test_dkvt_companion_layout_sync_after_parent_reset();
+    friend int test_non_dkvt_context_bypasses_binding();
+
+public:
+    void transcode_to_tg(void * stream) override;
+    void dkvt_bind_pp() override;
+    void dkvt_reset() override;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
@@ -395,6 +457,8 @@ public:
     // Override virtual methods from llama_memory_context_i
     ggml_tensor * get_turbo_rot_forward() const override;
     ggml_tensor * get_turbo_rot_inverse() const override;
+
+    const llama_kv_cache_context * as_kv_cache_context() const override { return this; }
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;

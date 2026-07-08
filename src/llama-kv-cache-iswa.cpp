@@ -63,12 +63,15 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     llama_memory_t mem_other_base = nullptr;
     if (mem_other) {
-        mem_other_base = static_cast<llama_kv_cache_iswa *>(mem_other)->get_base();
+        mem_other_base = mem_other->as_kv_cache();
     }
 
     llama_memory_t mem_other_swa = nullptr;
-    if (mem_other) {
-        mem_other_swa = static_cast<llama_kv_cache_iswa *>(mem_other)->get_swa();
+    {
+        auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(mem_other);
+        if (iswa) {
+            mem_other_swa = iswa->get_swa();
+        }
     }
 
     kv_base = std::make_unique<llama_kv_cache>(
@@ -82,6 +85,21 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+}
+
+void llama_kv_cache_iswa::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
+    kv_base->init_dkvt(n_ubatch, sched);
+    kv_swa ->init_dkvt(n_ubatch, sched);
+}
+
+void llama_kv_cache_iswa::transcode_to_tg(void * stream) {
+    kv_base->transcode_to_tg(stream);
+    kv_swa ->transcode_to_tg(stream);
+}
+
+void llama_kv_cache_iswa::dkvt_bind_pp() {
+    kv_base->dkvt_bind_pp();
+    kv_swa ->dkvt_bind_pp();
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

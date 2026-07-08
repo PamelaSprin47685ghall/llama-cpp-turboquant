@@ -1,6 +1,9 @@
 #include "llama-context.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 
 #include "ggml.h"
+#include "ggml-cuda.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -17,6 +20,10 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+extern "C" void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+
+extern "C" void ggml_cuda_stream_synchronize(void * stream);
 
 //
 // llama_context
@@ -46,7 +53,7 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
-    cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    cparams.n_seq_max = params.n_seq_max;
     cparams.n_outputs_max = params.n_outputs_max;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
@@ -90,15 +97,11 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
-    cparams.share_compute_buffers_with = params.share_compute_buffers_with;
 
-    // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
-            // TODO: change from runtime_error to llama_exception to avoid printing error message
             throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
         }
-
         cparams.ctx_other = params.ctx_other;
     }
 
@@ -110,6 +113,8 @@ llama_context::llama_context(
             cparams.ctx_other = params.ctx_other;
         }
     }
+
+    cparams.share_compute_buffers_with = params.share_compute_buffers_with;
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -1359,6 +1364,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // 动态 KV 转码 (DKVT) 延迟初始化：图分配前，一键替换与重映射
+        if (memory) {
+            memory->init_dkvt(cparams.n_ubatch, sched.get());
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1705,6 +1715,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    if (batch_inp.n_tokens == 1 && memory && !memory->get_is_transcoded_tg()) {
+        void * stream = nullptr;
+        if (sched) {
+            int n_backends = ggml_backend_sched_get_n_backends(sched.get());
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_t backend = ggml_backend_sched_get_backend(sched.get(), i);
+                if (backend && ggml_backend_is_cuda(backend)) {
+                    stream = ggml_backend_cuda_get_stream(backend);
+                    break;
+                }
+            }
+        }
+        memory->transcode_to_tg(stream);
+        if (stream) {
+            ggml_cuda_stream_synchronize(stream);
+        }
     }
 
     const auto & vocab   = model.vocab;
@@ -2392,6 +2420,11 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
+
+    // 动态 KV 转码 (DKVT) 延迟初始化：图分配前，一键替换与重映射
+    if (memory) {
+        memory->init_dkvt(cparams.n_ubatch, sched.get());
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -3518,6 +3551,22 @@ llama_context * llama_init_from_model(
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
         return nullptr;
+    }
+
+    // DKVT 刚性约束：Turbo KV Cache 双向对撞显存别名要求单会话独占，防止多 Slot 并发时
+    // PP 阶段计算图与 TG 阶段 KV 显存区间发生重叠撕裂
+    {
+        bool has_turbo_cache = (params.type_k == GGML_TYPE_TURBO2_0 ||
+                                params.type_k == GGML_TYPE_TURBO3_0 ||
+                                params.type_k == GGML_TYPE_TURBO4_0 ||
+                                params.type_v == GGML_TYPE_TURBO2_0 ||
+                                params.type_v == GGML_TYPE_TURBO3_0 ||
+                                params.type_v == GGML_TYPE_TURBO4_0);
+        if (has_turbo_cache && params.n_seq_max > 1) {
+            LLAMA_LOG_ERROR("%s: DKVT with turbo KV cache requires n_parallel/n_seq_max = 1 (single-session exclusive). Got %u.\n",
+                    __func__, params.n_seq_max);
+            throw std::runtime_error("DKVT is only supported with n_parallel/n_seq_max = 1");
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

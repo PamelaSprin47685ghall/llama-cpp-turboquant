@@ -557,6 +557,9 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
                 if (!galloc->is_borrowed || !galloc->is_borrowed[i]) {
                     ggml_vbuffer_free(galloc->buffers[i]);
                 }
+                // borrowed buffer: skip freeing — the vbuffer wrapper is owned
+                // by the src allocator and will be freed there. Double-free or
+                // freeing a shared wrapper would leave a dangling pointer.
             }
         }
         if (galloc->buf_tallocs != NULL) {
@@ -630,6 +633,13 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
+    if (node->flags & GGML_TENSOR_FLAG_EXT) {
+        hn->allocated = true;
+        hn->addr.chunk = -1;
+        hn->addr.offset = 0;
+        return;
+    }
+
     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
         hn->allocated = true;
         assert(hn->addr.offset == 0);
@@ -695,6 +705,9 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
+    if (node->flags & GGML_TENSOR_FLAG_EXT) {
+        return;
+    }
     // graph outputs are never freed
     if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
         AT_PRINTF("not freeing output %s\n", node->name);
@@ -938,7 +951,14 @@ static bool ggml_gallocr_reserve_n_impl(
                 }
             }
 #endif
-            ggml_vbuffer_free(galloc->buffers[i]);
+            if (galloc->is_borrowed && galloc->is_borrowed[i]) {
+                // borrowed buffer: do NOT free the vbuffer wrapper (shared pointer)
+                // just clear our reference to avoid double-free / dangling pointer
+                galloc->buffers[i] = NULL;
+                galloc->is_borrowed[i] = false;
+            } else {
+                ggml_vbuffer_free(galloc->buffers[i]);
+            }
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -974,6 +994,9 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 }
 
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+    if ((tensor->flags & GGML_TENSOR_FLAG_EXT) && tensor->view_src == NULL) {
+        return;
+    }
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
@@ -1163,6 +1186,9 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
 
     for (struct ggml_tensor * t = first; t != last; t = ggml_get_next_tensor(ctx, t)) {
         enum ggml_status status = GGML_STATUS_SUCCESS;
+        if ((t->flags & GGML_TENSOR_FLAG_EXT) || (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_EXT))) {
+            continue;
+        }
         if (t->data == NULL) {
             if (t->view_src == NULL) {
                 status = ggml_tallocr_alloc(&tallocr, t);
@@ -1199,6 +1225,9 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
     size_t cur_buf_size = 0;
     struct ggml_tensor * first = ggml_get_first_tensor(ctx);
     for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if ((t->flags & GGML_TENSOR_FLAG_EXT) || (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_EXT))) {
+            continue;
+        }
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
             this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);

@@ -2009,6 +2009,9 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 
 enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
+    if ((tensor->flags & GGML_TENSOR_FLAG_EXT) && tensor->view_src == NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
     GGML_ASSERT(tensor->buffer == NULL);
     GGML_ASSERT(tensor->view_src != NULL);
     GGML_ASSERT(tensor->view_src->buffer != NULL);
@@ -2398,4 +2401,27 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+struct vbuffer {
+    ggml_backend_buffer_t chunks[16]; // 16 matches GGML_VBUFFER_MAX_CHUNKS
+};
+
+void ggml_backend_sched_set_custom_buffer(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_t buf) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
+    
+    struct vbuffer * old_buf = (struct vbuffer *)ggml_gallocr_get_buffer(sched->galloc, backend_id);
+    if (old_buf) {
+        if (!ggml_gallocr_is_borrowed(sched->galloc, backend_id)) {
+            ggml_gallocr_free_buffer((struct vbuffer *)old_buf);
+        }
+    }
+    
+    struct vbuffer * custom_vbuf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
+    if (custom_vbuf) {
+        custom_vbuf->chunks[0] = buf;
+        ggml_gallocr_set_buffer(sched->galloc, backend_id, custom_vbuf);
+        ggml_gallocr_set_borrowed(sched->galloc, backend_id, true);
+    }
 }

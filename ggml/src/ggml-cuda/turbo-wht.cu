@@ -123,6 +123,7 @@ static __global__ void k_turbo_wht_copy_tail(const float * __restrict__ src,
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
     const ggml_tensor * src = dst->src[0];
     const ggml_tensor * scale_tensor = dst->src[1];  // InnerQ scale_inv (may be NULL)
 
@@ -147,8 +148,6 @@ void ggml_cuda_turbo_wht(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float * src_ptr = (const float *) src->data;
     float       * dst_ptr = (float       *) dst->data;
     const float * scale_inv_ptr = scale_tensor ? (const float *) scale_tensor->data : nullptr;
-
-    cudaStream_t stream = ctx.stream();
 
     // Process full groups
     if (n_groups > 0) {

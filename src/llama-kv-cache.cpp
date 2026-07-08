@@ -1,5 +1,7 @@
 #include "llama-kv-cache.h"
 
+#include "../ggml/src/ggml-quants.h"
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -101,6 +103,12 @@ TURBO_IQ_IMPORT void turbo_innerq_mark_tensor_updated(void);
 // llama_kv_cache
 //
 
+llama_kv_cache::~llama_kv_cache() {
+    if (owns_union_block && vram_union_block) {
+        ggml_backend_buffer_free(vram_union_block);
+    }
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -120,9 +128,10 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
-    other(static_cast<llama_kv_cache *>(mem_other)),
+    other(mem_other ? mem_other->as_kv_cache() : nullptr),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl),
+    is_transcoded_tg(false) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -411,7 +420,13 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, layer_type_k, layer_type_v, 0, 0, 0, 0, 0, 0, 0, 0 });
+
+        // 动态 KV 转码 (DKVT)：仅当是 turbo 类型时标记外部托管指针绕过分配器
+        bool is_k_turbo = (layer_type_k == GGML_TYPE_TURBO2_0 || layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0);
+        bool is_v_turbo = (layer_type_v == GGML_TYPE_TURBO2_0 || layer_type_v == GGML_TYPE_TURBO3_0 || layer_type_v == GGML_TYPE_TURBO4_0);
+        if (is_k_turbo && k) k->flags |= GGML_TENSOR_FLAG_EXT;
+        if (is_v_turbo && v) v->flags |= GGML_TENSOR_FLAG_EXT;
 
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
@@ -424,6 +439,10 @@ llama_kv_cache::llama_kv_cache(
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
             turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
+
+            // Note: rotation/scale tensors are NOT marked EXT here. They live in
+            // the KV buffer which is managed normally. Only GQA K/V tensors that
+            // are externally bound to the union buffer get GGML_TENSOR_FLAG_EXT.
         }
     }
 
@@ -455,12 +474,22 @@ llama_kv_cache::llama_kv_cache(
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 256); // dummy buffer (256B to avoid CUDA 0-size nullptr)
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            // If all tensors are external/views (e.g. DKVT draft context), the allocator
+            // returns NULL. Fall back to a small dummy buffer to avoid nullptr dereference.
+            if (!buf) {
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 256); // dummy buffer
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    if (t->flags & GGML_TENSOR_FLAG_EXT) {
+                        t->buffer = buf;
+                    }
+                }
+            }
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -513,6 +542,14 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+
+        // TurboQuant: reuse rotation matrices and InnerQ scale from parent cache
+        // to avoid illegal memory access during draft/MTP speculative decoding.
+        // The draft cache's own layer loop would create uninitialized tensors
+        // (nullptr data) since its buffers never get the rotation data filled.
+        turbo_rotation      = other->turbo_rotation;
+        turbo_rotation_inv  = other->turbo_rotation_inv;
+        turbo_innerq_scale_inv = other->turbo_innerq_scale_inv;
     } else {
         // TurboQuant: master's #21038 attention rotation is OFF by default on this
         // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
@@ -606,6 +643,9 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    is_transcoded_tg = false;
+    dkvt_bind_pp();
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -940,7 +980,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         if (hparams.no_alloc) {
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
+            // DKVT: no_alloc now uses a 256-byte dummy buffer to avoid 0-size CUDA
+            // allocation failure. The dummy buffer has a non-null base, so the old
+            // assertion no longer holds. Size estimation falls back to the theoretical
+            // tensor footprint regardless of the dummy buffer's actual capacity.
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
@@ -2974,3 +3017,13 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 bool llama_kv_cache::has_layer(int32_t il) const {
     return map_layer_ids.count(il) > 0;
 }
+
+void llama_kv_cache::dkvt_reset() {
+    if (!vram_union_block || !ptr_start) return;
+    is_transcoded_tg = false;
+    dkvt_bind_pp();
+}
+
+// DKVT implementations (dkvt_bind_pp, dkvt_bind_tg, transcode_to_tg, init_dkvt)
+// moved to src/llama-kv-cache-dkvt.cpp and src/llama-kv-cache-transcode.cpp
+

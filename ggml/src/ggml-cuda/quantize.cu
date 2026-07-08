@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "dequantize.cuh"
 #include <cstdint>
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
@@ -447,4 +448,180 @@ void quantize_mmq_fp4_cuda(
 
         quantize_mmq_mxfp4<<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
     }
+}
+
+// 动态 KV 转码 (DKVT) GPU 显存原位转码核函数与 C 接口
+__global__ void transcode_k_turbo4_to_f16_kernel(
+    const block_turbo4_0 * __restrict__ src,
+    half *                 __restrict__ dst,
+    const int64_t          head_size_k,
+    const int64_t          kv_size) 
+{
+    const int64_t ib = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (ib >= kv_size * (head_size_k / 128)) return;
+
+    const float norm = __half2float(src[ib].norm);
+    float val = turbo4_dequant_element(&src[ib], tid, norm);
+    dst[ib * 128 + tid] = __float2half(val);
+}
+
+__global__ void transcode_k_turbo2_to_f16_kernel(
+    const block_turbo2_0 * __restrict__ src,
+    half *                 __restrict__ dst,
+    const int64_t          head_size_k,
+    const int64_t          kv_size)
+{
+    const int64_t ib = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (ib >= kv_size * (head_size_k / 128)) return;
+
+    const float norm = __half2float(src[ib].norm);
+    float val = turbo2_dequant_element(&src[ib], tid, norm);
+    dst[ib * 128 + tid] = __float2half(val);
+}
+
+extern "C" void ggml_cuda_transcode_k(
+    const void * src, void * dst,
+    int64_t head_size_k, int64_t kv_size, int type_k, void * stream);
+
+extern "C" void ggml_cuda_transcode_v(
+    const void * src, void * dst,
+    int64_t head_size_v, int64_t kv_size, int type_v, void * stream);
+
+extern "C" void ggml_cuda_device_to_device_copy_async(
+    void * dst, const void * src, size_t size, void * stream);
+
+extern "C" void ggml_cuda_stream_synchronize(void * stream);
+
+extern "C" void ggml_cuda_transcode_k(
+    const void * src, void * dst,
+    int64_t head_size_k, int64_t kv_size, int type_k, void * stream)
+{
+    cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+
+    if (type_k == GGML_TYPE_TURBO4_0) {
+        int64_t num_blocks = kv_size * (head_size_k / 128);
+        dim3 block_size(128, 1, 1);
+        dim3 grid_size(num_blocks, 1, 1);
+        transcode_k_turbo4_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const block_turbo4_0 *)src, (half *)dst, head_size_k, kv_size);
+    } else     if (type_k == GGML_TYPE_TURBO2_0) {
+        int64_t num_blocks = kv_size * (head_size_k / 128);
+        dim3 block_size(128, 1, 1);
+        dim3 grid_size(num_blocks, 1, 1);
+        transcode_k_turbo2_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const block_turbo2_0 *)src, (half *)dst, head_size_k, kv_size);
+    }
+}
+
+__global__ void transcode_v_turbo2_to_q8_0_kernel(
+    const block_turbo2_0 * __restrict__ src,
+    block_q8_0 *           __restrict__ dst,
+    const int64_t          head_size_v,
+    const int64_t          kv_size)
+{
+    const int64_t ib = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (ib >= kv_size * (head_size_v / 128)) return;
+
+    const float norm = __half2float(src[ib].norm);
+    float val = turbo2_dequant_element(&src[ib], tid, norm);
+
+    const int sub_group = tid / 32;
+    const int lane_id = tid % 32;
+
+    float abs_val = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        abs_val = fmaxf(abs_val, __shfl_down_sync(0xffffffff, abs_val, offset));
+    }
+
+    __shared__ float shared_scales[4];
+    if (lane_id == 0) {
+        shared_scales[sub_group] = abs_val / 127.0f;
+    }
+    __syncthreads();
+
+    const int64_t dst_ib = ib * 4 + sub_group;
+    float scale = shared_scales[sub_group];
+    if (lane_id == 0) {
+        dst[dst_ib].d = __float2half(scale);
+    }
+
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    dst[dst_ib].qs[lane_id] = (int8_t)__float2int_rn(val * inv_scale);
+}
+
+__global__ void transcode_v_turbo4_to_q8_0_kernel(
+    const block_turbo4_0 * __restrict__ src,
+    block_q8_0 *           __restrict__ dst,
+    const int64_t          head_size_v,
+    const int64_t          kv_size) 
+{
+    const int64_t ib = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (ib >= kv_size * (head_size_v / 128)) return;
+
+    const float norm = __half2float(src[ib].norm);
+    float val = turbo4_dequant_element(&src[ib], tid, norm);
+
+    const int sub_group = tid / 32;
+    const int lane_id = tid % 32;
+
+    float abs_val = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        abs_val = fmaxf(abs_val, __shfl_down_sync(0xffffffff, abs_val, offset));
+    }
+
+    __shared__ float shared_scales[4];
+    if (lane_id == 0) {
+        shared_scales[sub_group] = abs_val / 127.0f;
+    }
+    __syncthreads();
+
+    const int64_t dst_ib = ib * 4 + sub_group;
+    float scale = shared_scales[sub_group];
+    if (lane_id == 0) {
+        dst[dst_ib].d = __float2half(scale);
+    }
+    
+    float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+    dst[dst_ib].qs[lane_id] = (int8_t)__float2int_rn(val * inv_scale);
+}
+
+extern "C" void ggml_cuda_transcode_v(
+    const void * src, void * dst,
+    int64_t head_size_v, int64_t kv_size, int type_v, void * stream)
+{
+    cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+
+    if (type_v == GGML_TYPE_TURBO2_0) {
+        int64_t num_blocks = kv_size * (head_size_v / 128);
+        dim3 block_size(128, 1, 1);
+        dim3 grid_size(num_blocks, 1, 1);
+        transcode_v_turbo2_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const block_turbo2_0 *)src, (block_q8_0 *)dst, head_size_v, kv_size);
+    } else if (type_v == GGML_TYPE_TURBO4_0) {
+        int64_t num_blocks = kv_size * (head_size_v / 128);
+        dim3 block_size(128, 1, 1);
+        dim3 grid_size(num_blocks, 1, 1);
+        transcode_v_turbo4_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const block_turbo4_0 *)src, (block_q8_0 *)dst, head_size_v, kv_size);
+    }
+}
+
+extern "C" void ggml_cuda_device_to_device_copy_async(void * dst, const void * src, size_t size, void * stream) {
+    cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+    cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_stream);
+}
+
+extern "C" void ggml_cuda_stream_synchronize(void * stream) {
+    cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+    cudaStreamSynchronize(cuda_stream);
 }

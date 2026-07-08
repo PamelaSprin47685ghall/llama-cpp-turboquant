@@ -193,6 +193,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-llama-archs.cpp)
     llama_build_and_test(test-shared-buffers.cpp)
+    llama_build_and_test(test-dkvt-numerical.cpp)
+    llama_build_and_test(test-dkvt-layout.cpp)
+    llama_build_and_test(test-dkvt-companion.cpp)
+    target_include_directories(test-dkvt-companion PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

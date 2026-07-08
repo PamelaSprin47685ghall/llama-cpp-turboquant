@@ -583,6 +583,139 @@ static void test_reallocation() {
     }
 }
 
+//
+// DKVT / EXT tensor regression tests
+
+// Verify that a tensor flagged with GGML_TENSOR_FLAG_EXT is skipped by the graph allocator:
+// it receives no buffer, consumes no memory, and its data pointer is left untouched.
+static void test_ext_tensor_alloc_bypass() {
+    dummy_backend backend      = dummy_backend_init(64);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    // One normal input + one EXT input + one normal computation consuming the normal input
+    ggml_tensor * x[4];
+    x[0] = make_input_with_size(ctx, 16);          // normal tensor, will be allocated
+    x[1] = make_input_with_size(ctx, 16);          // will be flagged EXT
+    x[1]->flags |= GGML_TENSOR_FLAG_EXT;
+    x[2] = ggml_add(ctx, x[0], x[0]);              // normal node, reuses x[0] buffer
+    x[3] = ggml_add(ctx, x[2], x[1]);              // consumes EXT tensor x[1]
+    assign_names(ctx);
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, x[3], &backend.buffer_type);
+
+    // The EXT tensor must NOT have a buffer assigned by the allocator
+    GGML_ASSERT(x[1]->buffer == nullptr);
+    // Its data pointer must remain whatever we set it to (not overwritten)
+    // (in this dummy backend get_base returns alloc_base, but EXT tensors are skipped entirely)
+
+    // All non-EXT nodes must be allocated
+    GGML_ASSERT(x[0]->buffer != nullptr);
+    GGML_ASSERT(x[2]->buffer != nullptr);
+    GGML_ASSERT(x[3]->buffer != nullptr);
+
+    // Total allocated must fit in a single buffer (only x[0] at 16 bytes + overhead)
+    GGML_ASSERT(backend.context->allocated_total() <= 64);
+}
+
+// Verify that a view derived from an EXT tensor correctly inherits its data pointer:
+// the view's data = EXT base data + view offset, and the view is also skipped by allocator.
+static void test_ext_tensor_view_data_derive() {
+    dummy_backend backend      = dummy_backend_init(64);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[4];
+    x[0] = make_input_with_size(ctx, 32);          // EXT base tensor
+    x[0]->flags |= GGML_TENSOR_FLAG_EXT;
+    x[0]->data = (void *) 0x1000;                  // simulate external physical address
+    x[1] = ggml_view_1d(ctx, x[0], 4, 4);          // view: 4 elements starting at byte offset 4
+    x[2] = make_input_with_size(ctx, 8);           // normal tensor for computation
+    x[3] = ggml_add(ctx, x[1], x[2]);              // consumes the view
+    assign_names(ctx);
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, x[3], &backend.buffer_type);
+
+    // The view's data pointer must be derived from the EXT base + offset
+    GGML_ASSERT(x[1]->data == (void *) ((uint8_t *) x[0]->data + 4));
+    // The view must also be skipped by the allocator (no buffer)
+    GGML_ASSERT(x[1]->buffer == nullptr);
+    // Normal tensor is allocated
+    GGML_ASSERT(x[2]->buffer != nullptr);
+    GGML_ASSERT(x[3]->buffer != nullptr);
+}
+
+// Verify that ggml_backend_alloc_ctx_tensors_from_buft_size excludes EXT tensors
+// from the computed total size.  Context with one normal tensor (16 bytes) and one
+// EXT tensor (16 bytes) should report size for only the normal tensor.
+static void test_ext_tensor_context_alloc_bypass() {
+    ggml_init_params params{};
+    params.mem_size = 64 * ggml_tensor_overhead() + ggml_graph_overhead();
+    params.no_alloc = true;
+
+    ggml_context *   ctx     = ggml_init(params);
+    ggml_context_ptr ctx_ptr = ggml_context_ptr(ctx);
+
+    // Normal tensor: 16 bytes of F32 data
+    ggml_tensor * normal = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_name(normal, "normal");
+
+    // EXT tensor: 16 bytes of F32 data, flagged as external
+    ggml_tensor * ext = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_set_name(ext, "ext");
+    ext->flags |= GGML_TENSOR_FLAG_EXT;
+
+    // Use the dummy backend's buffer type for size computation
+    dummy_backend backend = dummy_backend_init(64);
+    size_t computed_size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, &backend.buffer_type);
+
+    // The EXT tensor must be excluded: only the normal tensor's 16 bytes count
+    // (plus alignment padding, but definitely < 32)
+    GGML_ASSERT(computed_size > 0);
+    GGML_ASSERT(computed_size <= 16);  // 16 bytes exactly with 8-byte alignment
+}
+
+// Verify that when a gallocr has a borrowed buffer, destroying the gallocr does NOT
+// free the underlying vbuffer (is_borrowed protection).
+static void test_share_buffers_borrowed_free() {
+    dummy_backend backend = dummy_backend_init(64);
+
+    // Create a "src" gallocr and allocate a graph to get a real buffer
+    auto [ctx_a, graph_a, ctx_a_ptr] = make_context();
+    ggml_tensor * a[2];
+    a[0] = make_input_with_size(ctx_a, 16);
+    a[1] = ggml_add(ctx_a, a[0], a[0]);
+    ggml_set_output(a[1]);
+    ggml_build_forward_expand(graph_a, a[1]);
+    assign_names(ctx_a);
+
+    ggml_gallocr_ptr galloc_src(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_reserve(galloc_src.get(), graph_a);
+    bool ok = ggml_gallocr_alloc_graph(galloc_src.get(), graph_a);
+    GGML_ASSERT(ok);
+
+    size_t src_buffer_size = ggml_gallocr_get_buffer_size(galloc_src.get(), 0);
+    GGML_ASSERT(src_buffer_size > 0);
+
+    // Create a "dst" gallocr and set its buffer to the src buffer, marked as borrowed
+    ggml_gallocr_ptr galloc_dst(ggml_gallocr_new(&backend.buffer_type));
+    ggml_gallocr_set_buffer(galloc_dst.get(), 0, ggml_gallocr_get_buffer(galloc_src.get(), 0));
+    ggml_gallocr_set_borrowed(galloc_dst.get(), 0, true);
+
+    // Verify the borrowed flag is set
+    GGML_ASSERT(ggml_gallocr_is_borrowed(galloc_dst.get(), 0) == true);
+    GGML_ASSERT(ggml_gallocr_is_borrowed(galloc_src.get(), 0) == false);
+
+    // Destroy dst (borrowed) — this must NOT free the shared buffer
+    galloc_dst.reset();
+
+    // After destroying dst, src's buffer must still be valid
+    GGML_ASSERT(ggml_gallocr_get_buffer_size(galloc_src.get(), 0) == src_buffer_size);
+
+    // Now destroy src — this WILL free the buffer (it's the owner)
+    galloc_src.reset();
+
+    // No crash = success. The borrowed buffer was not double-freed.
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -604,5 +737,9 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_ext_tensor_alloc_bypass", test_ext_tensor_alloc_bypass);
+    run("test_ext_tensor_view_data_derive", test_ext_tensor_view_data_derive);
+    run("test_ext_tensor_context_alloc_bypass", test_ext_tensor_context_alloc_bypass);
+    run("test_share_buffers_borrowed_free", test_share_buffers_borrowed_free);
     return 0;
 }

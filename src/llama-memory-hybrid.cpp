@@ -135,6 +135,18 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+void llama_memory_hybrid::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
+    if (mem_attn) mem_attn->init_dkvt(n_ubatch, sched);
+}
+
+void llama_memory_hybrid::transcode_to_tg(void * stream) {
+    if (mem_attn) mem_attn->transcode_to_tg(stream);
+}
+
+void llama_memory_hybrid::dkvt_bind_pp() {
+    if (mem_attn) mem_attn->dkvt_bind_pp();
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
@@ -288,4 +300,8 @@ ggml_tensor * llama_memory_hybrid_context::get_turbo_innerq_scale_inv() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+const llama_kv_cache_context * llama_memory_hybrid_context::as_kv_cache_context() const {
+    return ctx_attn ? ctx_attn->as_kv_cache_context() : nullptr;
 }

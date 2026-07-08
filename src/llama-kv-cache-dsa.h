@@ -46,6 +46,8 @@ public:
 
     bool get_can_shift() const override;
 
+    llama_kv_cache * as_kv_cache() override { return get_mla(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
