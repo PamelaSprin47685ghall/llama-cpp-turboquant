@@ -125,11 +125,12 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
-    model(model), hparams(hparams), v_trans(v_trans),
+    const  layer_share_cb & share,
+                     bool   is_mtp) :
+    model(model), hparams(hparams), v_trans(v_trans), orig_v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(mem_other ? mem_other->as_kv_cache() : nullptr),
-    v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
+    v_cells_impl(std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl),
     is_transcoded_tg(false) {
 
@@ -468,6 +469,10 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
+    }
+
+    if (is_mtp) {
+        disable_dkvt_ext_flags();
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -3020,6 +3025,7 @@ bool llama_kv_cache::has_layer(int32_t il) const {
 
 void llama_kv_cache::dkvt_reset() {
     if (!vram_union_block || !ptr_start) return;
+    v_trans = orig_v_trans;
     is_transcoded_tg = false;
     dkvt_bind_pp();
 }

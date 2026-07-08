@@ -2394,7 +2394,7 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
-        const int64_t padded_v_head = v->ne[0];
+        const int64_t padded_v_head = (v->nb[1] > v->nb[2]) ? v->ne[2] : v->ne[0];
         if (padded_v_head != orig_v_head) {
             // Reshape to 4D, extract original head_dim, reshape back to 2D
             // Fix #78 (bingh0): cur shape post-MHA is (n_embd_head * n_head, n_tokens),

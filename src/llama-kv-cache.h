@@ -112,13 +112,16 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                         bool   is_mtp = false);
 
     void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
+    void disable_dkvt_ext_flags() override;
 
     bool get_is_transcoded_tg() const override { return other ? other->get_is_transcoded_tg() : is_transcoded_tg; }
 
     llama_kv_cache * as_kv_cache() override { return this; }
+    const llama_kv_cache * get_other() const { return other; }
 
     ~llama_kv_cache();
 
@@ -263,6 +266,7 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+    bool orig_v_trans = true;  // the original transposition status
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

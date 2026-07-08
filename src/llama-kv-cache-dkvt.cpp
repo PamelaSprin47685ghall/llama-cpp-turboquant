@@ -17,18 +17,18 @@ extern "C" bool ggml_cuda_get_mem_info(size_t * free, size_t * total);
 void llama_kv_cache::dkvt_bind_pp() {
     if (!vram_union_block || !ptr_start) return;
 
-    // 正向连续布局：计算图从 ptr_start 正向生长，KV Cache 从 ptr_start + size_act_pp 正向生长
+    // 正向连续布局：V 段在低地址，K 段在高地址，两段均从段首向段尾正向生长
     // V 段基址 = ptr_start + size_act_pp + layers[i].v_offset_pp
     // K 段基址 = ptr_start + size_act_pp + dkvt_v_size_pp + layers[i].k_offset_pp
     char * kv_base_pp = ptr_start + size_act_pp;
 
     for (size_t i = 0; i < layers.size(); ++i) {
-        if (layers[i].v) {
+        if (layers[i].v && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT)) {
             layers[i].v->buffer = vram_union_block;
             layers[i].v->data = kv_base_pp + layers[i].v_offset_pp;
             dkvt_update_strides(layers[i].v, layers[i].orig_type_v);
         }
-        if (layers[i].k) {
+        if (layers[i].k && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) {
             layers[i].k->buffer = vram_union_block;
             layers[i].k->data = kv_base_pp + dkvt_v_size_pp + layers[i].k_offset_pp;
             dkvt_update_strides(layers[i].k, layers[i].orig_type_k);
@@ -36,18 +36,22 @@ void llama_kv_cache::dkvt_bind_pp() {
     }
 
     for (size_t i = 0; i < layers.size(); ++i) {
-        for (size_t s = 0; s < layers[i].k_stream.size(); ++s) {
-            if (layers[i].k_stream[s]) {
-                layers[i].k_stream[s]->buffer = vram_union_block;
-                dkvt_update_strides(layers[i].k_stream[s], layers[i].orig_type_k);
-                layers[i].k_stream[s]->data = (char*)layers[i].k->data + s * layers[i].k->nb[2];
+        if (layers[i].k && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) {
+            for (size_t s = 0; s < layers[i].k_stream.size(); ++s) {
+                if (layers[i].k_stream[s]) {
+                    layers[i].k_stream[s]->buffer = vram_union_block;
+                    dkvt_update_strides(layers[i].k_stream[s], layers[i].orig_type_k);
+                    layers[i].k_stream[s]->data = (char*)layers[i].k->data + s * layers[i].k->nb[2];
+                }
             }
         }
-        for (size_t s = 0; s < layers[i].v_stream.size(); ++s) {
-            if (layers[i].v_stream[s]) {
-                layers[i].v_stream[s]->buffer = vram_union_block;
-                dkvt_update_strides(layers[i].v_stream[s], layers[i].orig_type_v);
-                layers[i].v_stream[s]->data = (char*)layers[i].v->data + s * layers[i].v->nb[2];
+        if (layers[i].v && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT)) {
+            for (size_t s = 0; s < layers[i].v_stream.size(); ++s) {
+                if (layers[i].v_stream[s]) {
+                    layers[i].v_stream[s]->buffer = vram_union_block;
+                    dkvt_update_strides(layers[i].v_stream[s], layers[i].orig_type_v);
+                    layers[i].v_stream[s]->data = (char*)layers[i].v->data + s * layers[i].v->nb[2];
+                }
             }
         }
     }
@@ -63,14 +67,14 @@ void llama_kv_cache::dkvt_bind_tg() {
 
     for (size_t i = 0; i < layers.size(); ++i) {
         ggml_type target_type_k = is_transcodable_type(layers[i].orig_type_k) ? GGML_TYPE_F16 : layers[i].orig_type_k;
-        ggml_type target_type_v = is_transcodable_type(layers[i].orig_type_v) ? GGML_TYPE_Q8_0 : layers[i].orig_type_v;
+        ggml_type target_type_v = is_transcodable_type(layers[i].orig_type_v) ? GGML_TYPE_F16 : layers[i].orig_type_v;
 
-        if (layers[i].v) {
+        if (layers[i].v && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT)) {
             layers[i].v->buffer = vram_union_block;
             layers[i].v->data = kv_base_tg + layers[i].v_offset_tg;
             dkvt_update_strides(layers[i].v, target_type_v);
         }
-        if (layers[i].k) {
+        if (layers[i].k && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) {
             layers[i].k->buffer = vram_union_block;
             layers[i].k->data = kv_base_tg + dkvt_v_size_tg + layers[i].k_offset_tg;
             dkvt_update_strides(layers[i].k, target_type_k);
@@ -79,20 +83,24 @@ void llama_kv_cache::dkvt_bind_tg() {
 
     for (size_t i = 0; i < layers.size(); ++i) {
         ggml_type target_type_k = is_transcodable_type(layers[i].orig_type_k) ? GGML_TYPE_F16 : layers[i].orig_type_k;
-        ggml_type target_type_v = is_transcodable_type(layers[i].orig_type_v) ? GGML_TYPE_Q8_0 : layers[i].orig_type_v;
+        ggml_type target_type_v = is_transcodable_type(layers[i].orig_type_v) ? GGML_TYPE_F16 : layers[i].orig_type_v;
 
-        for (size_t s = 0; s < layers[i].k_stream.size(); ++s) {
-            if (layers[i].k_stream[s]) {
-                layers[i].k_stream[s]->buffer = vram_union_block;
-                dkvt_update_strides(layers[i].k_stream[s], target_type_k);
-                layers[i].k_stream[s]->data = (char*)layers[i].k->data + s * layers[i].k->nb[2];
+        if (layers[i].k && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) {
+            for (size_t s = 0; s < layers[i].k_stream.size(); ++s) {
+                if (layers[i].k_stream[s]) {
+                    layers[i].k_stream[s]->buffer = vram_union_block;
+                    dkvt_update_strides(layers[i].k_stream[s], target_type_k);
+                    layers[i].k_stream[s]->data = (char*)layers[i].k->data + s * layers[i].k->nb[2];
+                }
             }
         }
-        for (size_t s = 0; s < layers[i].v_stream.size(); ++s) {
-            if (layers[i].v_stream[s]) {
-                layers[i].v_stream[s]->buffer = vram_union_block;
-                dkvt_update_strides(layers[i].v_stream[s], target_type_v);
-                layers[i].v_stream[s]->data = (char*)layers[i].v->data + s * layers[i].v->nb[2];
+        if (layers[i].v && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT)) {
+            for (size_t s = 0; s < layers[i].v_stream.size(); ++s) {
+                if (layers[i].v_stream[s]) {
+                    layers[i].v_stream[s]->buffer = vram_union_block;
+                    dkvt_update_strides(layers[i].v_stream[s], target_type_v);
+                    layers[i].v_stream[s]->data = (char*)layers[i].v->data + s * layers[i].v->nb[2];
+                }
             }
         }
     }
@@ -126,6 +134,24 @@ void llama_kv_cache::init_dkvt_borrow() {
             layers[i].k_size_tg   = other->layers[other_i].k_size_tg;
             layers[i].v_size_pp   = other->layers[other_i].v_size_pp;
             layers[i].v_size_tg   = other->layers[other_i].v_size_tg;
+        } else {
+            // Independent layer: clear EXT flag so allocator will allocate it
+            if (layers[i].k) {
+                layers[i].k->flags &= ~GGML_TENSOR_FLAG_EXT;
+            }
+            if (layers[i].v) {
+                layers[i].v->flags &= ~GGML_TENSOR_FLAG_EXT;
+            }
+            for (size_t s = 0; s < layers[i].k_stream.size(); ++s) {
+                if (layers[i].k_stream[s]) {
+                    layers[i].k_stream[s]->flags &= ~GGML_TENSOR_FLAG_EXT;
+                }
+            }
+            for (size_t s = 0; s < layers[i].v_stream.size(); ++s) {
+                if (layers[i].v_stream[s]) {
+                    layers[i].v_stream[s]->flags &= ~GGML_TENSOR_FLAG_EXT;
+                }
+            }
         }
     }
 
@@ -190,7 +216,7 @@ void llama_kv_cache::init_dkvt_sum_kv_sizes() {
             layers[i].k_offset_tg = (i == 0) ? 0 : (layers[i - 1].k_offset_tg + layers[i - 1].k_size_tg);
         }
         if (layers[i].v) {
-            ggml_type target_type_v = is_transcodable_type(layers[i].orig_type_v) ? GGML_TYPE_Q8_0 : layers[i].orig_type_v;
+            ggml_type target_type_v = is_transcodable_type(layers[i].orig_type_v) ? GGML_TYPE_F16 : layers[i].orig_type_v;
             layers[i].v_size_tg = ggml_row_size(target_type_v, layers[i].v->ne[0])
                                * layers[i].v->ne[1] * layers[i].v->ne[2] * layers[i].v->ne[3];
             layers[i].v_offset_tg = (i == 0) ? 0 : (layers[i - 1].v_offset_tg + layers[i - 1].v_size_tg);
@@ -236,14 +262,15 @@ bool llama_kv_cache::init_dkvt_alloc(ggml_backend_buffer_type_t buft) {
 }
 
 void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
+    LLAMA_LOG_INFO("llama_kv_cache: init_dkvt: other=%p, layers=%zu, n_seq_max=%u\n", (void*)other, layers.size(), n_seq_max);
     if (vram_union_block) return;
     if (!sched) return;
 
-    // 检查是否存在可转码层：若无任何 turbo 类型则无需 DKVT
+    // 检查是否存在可转码层且包含 EXT 标志：若无任何 EXT 标志则无需 DKVT
     bool has_transcodable = false;
     for (size_t i = 0; i < layers.size(); ++i) {
-        if ((layers[i].k && is_transcodable_type(layers[i].orig_type_k)) ||
-            (layers[i].v && is_transcodable_type(layers[i].orig_type_v))) {
+        if ((layers[i].k && is_transcodable_type(layers[i].orig_type_k) && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) ||
+            (layers[i].v && is_transcodable_type(layers[i].orig_type_v) && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT))) {
             has_transcodable = true;
             break;
         }
@@ -256,8 +283,9 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
             "DKVT with speculative decoding requires n_parallel/n_seq_max = 1.");
     }
 
-    // 伴生上下文：不参与别名分配和转码，直接返回
+    // 伴生上下文直接借用主上下文的 union buffer，无需独立分配
     if (other) {
+        init_dkvt_borrow();
         return;
     }
 
@@ -331,4 +359,25 @@ void llama_kv_cache::init_dkvt_compute_activation_size(size_t n_ubatch) {
     const size_t kv_size = get_size();
     const size_t score_act_tg = n_head * 1 * kv_size;
     size_act_tg = sizeof(float) * (1 * base_act + score_act_tg);
+}
+
+void llama_kv_cache::disable_dkvt_ext_flags() {
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i].k) {
+            layers[i].k->flags &= ~GGML_TENSOR_FLAG_EXT;
+        }
+        if (layers[i].v) {
+            layers[i].v->flags &= ~GGML_TENSOR_FLAG_EXT;
+        }
+        for (size_t s = 0; s < layers[i].k_stream.size(); ++s) {
+            if (layers[i].k_stream[s]) {
+                layers[i].k_stream[s]->flags &= ~GGML_TENSOR_FLAG_EXT;
+            }
+        }
+        for (size_t s = 0; s < layers[i].v_stream.size(); ++s) {
+            if (layers[i].v_stream[s]) {
+                layers[i].v_stream[s]->flags &= ~GGML_TENSOR_FLAG_EXT;
+            }
+        }
+    }
 }

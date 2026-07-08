@@ -2199,10 +2199,11 @@ llama_memory_i * res;
                                     cparams.n_seq_max,
                                     cparams.n_ubatch,
                                     1,
-                                    nullptr,
+                                    params.mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2220,10 +2221,11 @@ llama_memory_i * res;
                                 1,
                                 hparams.n_swa,
                                 hparams.swa_type,
-                                nullptr,
+                                params.mem_other,
                                 filter,
                                 nullptr,
-                                share);
+                                share,
+                                cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
                     }
                 }
             }

@@ -605,14 +605,14 @@ extern "C" void ggml_cuda_transcode_v(
         int64_t num_blocks = kv_size * (head_size_v / 128);
         dim3 block_size(128, 1, 1);
         dim3 grid_size(num_blocks, 1, 1);
-        transcode_v_turbo2_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-            (const block_turbo2_0 *)src, (block_q8_0 *)dst, head_size_v, kv_size);
+        transcode_k_turbo2_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const block_turbo2_0 *)src, (half *)dst, head_size_v, kv_size);
     } else if (type_v == GGML_TYPE_TURBO4_0) {
         int64_t num_blocks = kv_size * (head_size_v / 128);
         dim3 block_size(128, 1, 1);
         dim3 grid_size(num_blocks, 1, 1);
-        transcode_v_turbo4_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-            (const block_turbo4_0 *)src, (block_q8_0 *)dst, head_size_v, kv_size);
+        transcode_k_turbo4_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const block_turbo4_0 *)src, (half *)dst, head_size_v, kv_size);
     }
 }
 

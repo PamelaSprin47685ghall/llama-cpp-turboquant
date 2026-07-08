@@ -28,7 +28,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                         bool   is_mtp = false);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -48,6 +49,7 @@ public:
     bool get_can_shift() const override;
 
     void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
+    void disable_dkvt_ext_flags() override { if (kv_base) kv_base->disable_dkvt_ext_flags(); if (kv_swa) kv_swa->disable_dkvt_ext_flags(); }
     void transcode_to_tg(void * stream) override;
     void dkvt_bind_pp() override;
     void dkvt_reset() override { if (kv_base) kv_base->dkvt_reset(); if (kv_swa) kv_swa->dkvt_reset(); }

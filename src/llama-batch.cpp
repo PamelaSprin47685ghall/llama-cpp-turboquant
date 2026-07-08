@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 
 #include <cassert>
 #include <cstring>
@@ -252,82 +253,87 @@ bool llama_batch_allocr::init(
     // consistency checks
     //
 
-    if (n_pos_per_embd > 1) {
-        // M-RoPE case: allow position to "jump" forward only (non-continuous positions are allowed)
-        for (uint32_t s = 0; s < n_seq_max; ++s) {
-            if (seq_pos[s].empty()) {
-                continue;
-            }
+    const auto * kv = memory ? const_cast<llama_memory_i *>(memory)->as_kv_cache() : nullptr;
+    const bool is_mtp_draft = kv && kv->get_other() != nullptr;
 
-            const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
-
-            if (batch.token) {
-                if (p0 >= 0 && p0 >= seq_pos_min(s)) {
-                    LLAMA_LOG_ERROR(
-                            "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
-                            " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
-                            " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " for M-RoPE, it is required that the position satisfies: X < Y\n",
-                            __func__, s, s, p0, s, seq_pos_min(s));
-
-                    return false;
-                }
-            } else {
-                // embedding inputs can have overlapping positions
-                if (p0 >= 0 && p0 > seq_pos_min(s)) {
-                    LLAMA_LOG_ERROR(
-                            "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
-                            " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
-                            " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " for M-RoPE, it is required that the position satisfies: X <= Y\n",
-                            __func__, s, s, p0, s, seq_pos_min(s));
-
-                    return false;
-                }
-            }
-        }
-    } else {
-        for (uint32_t s = 0; s < n_seq_max; ++s) {
-            if (seq_pos[s].empty()) {
-                continue;
-            }
-
-            const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
-
-            if (p0 >= 0) {
-                bool ok = true;
-
-                if (seq_pos_min(s) != p0 + 1) {
-                    ok = false;
+    if (!is_mtp_draft) {
+        if (n_pos_per_embd > 1) {
+            // M-RoPE case: allow position to "jump" forward only (non-continuous positions are allowed)
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                if (seq_pos[s].empty()) {
+                    continue;
                 }
 
-                if (!ok) {
-                    LLAMA_LOG_ERROR(
-                            "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
-                            " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
-                            " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " it is required that the sequence positions remain consecutive: Y = X + 1\n",
-                            __func__, s, s, p0, s, seq_pos_min(s));
+                const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-                    return false;
-                }
-            }
+                if (batch.token) {
+                    if (p0 >= 0 && p0 >= seq_pos_min(s)) {
+                        LLAMA_LOG_ERROR(
+                                "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
+                                " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
+                                " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
+                                " for M-RoPE, it is required that the position satisfies: X < Y\n",
+                                __func__, s, s, p0, s, seq_pos_min(s));
 
-            if (seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
-                LLAMA_LOG_ERROR("%s: sequence %d positions are not continuous\n", __func__, s);
-                return false;
-            }
-        }
-    }
-
-    if (memory) {
-        for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
-            for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
-                if (seq_cpl[s0][s1]) {
-                    if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
-                        memory->seq_pos_max(s0) != memory->seq_pos_max(s1)) {
-                        LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged\n", __func__, s0, s1);
                         return false;
+                    }
+                } else {
+                    // embedding inputs can have overlapping positions
+                    if (p0 >= 0 && p0 > seq_pos_min(s)) {
+                        LLAMA_LOG_ERROR(
+                                "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
+                                " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
+                                " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
+                                " for M-RoPE, it is required that the position satisfies: X <= Y\n",
+                                __func__, s, s, p0, s, seq_pos_min(s));
+
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                if (seq_pos[s].empty()) {
+                    continue;
+                }
+
+                const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
+
+                if (p0 >= 0) {
+                    bool ok = true;
+
+                    if (seq_pos_min(s) != p0 + 1) {
+                        ok = false;
+                    }
+
+                    if (!ok) {
+                        LLAMA_LOG_ERROR(
+                                "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
+                                " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
+                                " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
+                                " it is required that the sequence positions remain consecutive: Y = X + 1\n",
+                                __func__, s, s, p0, s, seq_pos_min(s));
+
+                        return false;
+                    }
+                }
+
+                if (seq_pos_max(s) - seq_pos_min(s) + 1 > (int) seq_pos[s].size()) {
+                    LLAMA_LOG_ERROR("%s: sequence %d positions are not continuous\n", __func__, s);
+                    return false;
+                }
+            }
+        }
+
+        if (memory) {
+            for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+                for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
+                    if (seq_cpl[s0][s1]) {
+                        if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
+                            memory->seq_pos_max(s0) != memory->seq_pos_max(s1)) {
+                            LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged\n", __func__, s0, s1);
+                            return false;
+                        }
                     }
                 }
             }

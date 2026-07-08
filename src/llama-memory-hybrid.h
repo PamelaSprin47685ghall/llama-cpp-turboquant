@@ -59,6 +59,7 @@ public:
     bool get_can_shift() const override;
 
     void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
+    void disable_dkvt_ext_flags() override { if (mem_attn) mem_attn->disable_dkvt_ext_flags(); }
     void transcode_to_tg(void * stream) override;
     void dkvt_bind_pp() override;
     void dkvt_reset() override { if (mem_attn) mem_attn->dkvt_reset(); }

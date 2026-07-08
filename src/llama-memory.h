@@ -146,6 +146,9 @@ struct llama_memory_i {
     // DKVT: reset layout pointers back to PP (turbo) layout after clear() or secondary prefill
     virtual void dkvt_bind_pp() {}
 
+    // DKVT: disable EXT flags to bypass DKVT allocation
+    virtual void disable_dkvt_ext_flags() {}
+
     // DKVT: full reset — clear transcoded flag and rebind PP layout
     virtual void dkvt_reset() {}
 

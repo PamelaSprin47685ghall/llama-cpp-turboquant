@@ -11,6 +11,24 @@
 #include <cstring>
 
 #ifdef GGML_USE_CUDA
+extern "C" {
+    typedef struct CUstream_st *cudaStream_t;
+    typedef enum {
+        cudaSuccess = 0
+    } cudaError_t;
+    typedef enum {
+        cudaMemcpyDeviceToDevice = 3
+    } cudaMemcpyKind;
+
+    cudaError_t cudaMalloc(void **devPtr, size_t size);
+    cudaError_t cudaFree(void *devPtr);
+    cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream);
+    cudaError_t cudaStreamSynchronize(cudaStream_t stream);
+    const char * cudaGetErrorString(cudaError_t error);
+}
+#endif
+
+#ifdef GGML_USE_CUDA
 extern "C" void ggml_cuda_transcode_k(
     const void * src, void * dst,
     int64_t head_size_k, int64_t kv_size, int type_k, void * stream);
@@ -76,16 +94,36 @@ void llama_kv_cache::transcode_to_tg_cuda_v(const char * v_src_base, char * v_ds
 
 void llama_kv_cache::transcode_to_tg_cuda(void * stream) {
 #ifdef GGML_USE_CUDA
-    // 正向连续布局：V 段在低地址，K 段在高地址，两段均正向生长
-    // PP 源: V 起始于 ptr_start + size_act_pp, K 起始于 ptr_start + size_act_pp + dkvt_v_size_pp
-    // TG 目标: V 起始于 ptr_start + size_act_tg, K 起始于 ptr_start + size_act_tg + dkvt_v_size_tg
-    char * k_src = ptr_start + size_act_pp + dkvt_v_size_pp;
-    char * v_src = ptr_start + size_act_pp;
-    char * k_dst = ptr_start + size_act_tg + dkvt_v_size_tg;
-    char * v_dst = ptr_start + size_act_tg;
+    size_t pp_size = dkvt_k_size_pp + dkvt_v_size_pp;
+    if (pp_size == 0) return;
 
-    transcode_to_tg_cuda_k(k_src, k_dst, stream);
-    transcode_to_tg_cuda_v(v_src, v_dst, stream);
+    void * temp_gpu_buf = nullptr;
+    cudaError_t err = cudaMalloc(&temp_gpu_buf, pp_size);
+    if (err != cudaSuccess) {
+        LLAMA_LOG_ERROR("llama_kv_cache: failed to allocate temp GPU buffer for transcoding: %s\n", cudaGetErrorString(err));
+        return;
+    }
+
+    char * src_base = ptr_start + size_act_pp;
+    cudaStream_t custream = (cudaStream_t)stream;
+    err = cudaMemcpyAsync(temp_gpu_buf, src_base, pp_size, cudaMemcpyDeviceToDevice, custream);
+    if (err != cudaSuccess) {
+        LLAMA_LOG_ERROR("llama_kv_cache: failed to copy PP KV cache to temp buffer: %s\n", cudaGetErrorString(err));
+        cudaFree(temp_gpu_buf);
+        return;
+    }
+
+    const char * v_src_temp = (const char *)temp_gpu_buf;
+    const char * k_src_temp = v_src_temp + dkvt_v_size_pp;
+
+    char * v_dst = ptr_start + size_act_tg;
+    char * k_dst = v_dst + dkvt_v_size_tg;
+
+    transcode_to_tg_cuda_k(k_src_temp, k_dst, stream);
+    transcode_to_tg_cuda_v(v_src_temp, v_dst, stream);
+
+    cudaStreamSynchronize(custream);
+    cudaFree(temp_gpu_buf);
 #else
     GGML_UNUSED(stream);
 #endif
@@ -206,6 +244,7 @@ void llama_kv_cache::transcode_to_tg(void * stream) {
     // 伴生上下文同步：若主上下文已转码，伴生上下文直接复用绑定
     if (other) {
         if (other->is_transcoded_tg && !is_transcoded_tg) {
+            v_trans = true;
             this->dkvt_bind_tg();
             is_transcoded_tg = true;
         }
@@ -240,5 +279,6 @@ void llama_kv_cache::transcode_to_tg(void * stream) {
         ggml_cuda_stream_synchronize(stream);
     }
 
+    v_trans = true;
     is_transcoded_tg = true;
 }
