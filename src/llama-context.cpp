@@ -1,5 +1,6 @@
 #include "llama-context.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-dkvt.h"
 #include "llama-memory-hybrid.h"
 
 #include "ggml.h"
@@ -630,15 +631,7 @@ void llama_context::sched_reserve() {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
-            if (cparams.pipeline_parallel) {
-                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
-            }
-            if (!gf) {
-                throw std::runtime_error("failed to allocate compute pp buffers");
-            }
+            throw std::runtime_error("failed to allocate compute pp buffers");
         }
 
         if (model.hparams.n_layer_nextn > 0 && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
@@ -655,15 +648,33 @@ void llama_context::sched_reserve() {
         n_nodes_pp  = ggml_graph_n_nodes(gf);
     }
 
-    // reserve with tg (token generation) graph to get the number of splits and nodes
+    // reserve with tg (token generation) graph using the worst-case speculative-verify batch size
+    // so that the DKVT compute cap is sized for decode + MTP draft verification.
+    // Keep n_seqs unchanged (typically 1) to avoid overflowing the recurrent-state views;
+    // set n_outputs to n_tokens so the logits/output tensor is sized for the full verify batch.
+    const uint32_t n_tokens_tg = std::max(n_seqs * DKVT_SPEC_VERIFY_MAX_BATCH, (uint32_t) DKVT_SPEC_VERIFY_MAX_BATCH);
+    const uint32_t n_outputs_tg = n_tokens_tg;
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+
+        if (memory && memory->get_dkvt_active()) {
+            size_t gpu_buf_tg = 0;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (backend_buft[i] && ggml_backend_buft_is_host(backend_buft[i])) {
+                    continue;
+                }
+                gpu_buf_tg = std::max(gpu_buf_tg, ggml_backend_sched_get_buffer_alloc_size(sched.get(), backend_ptrs[i]));
+            }
+            if (gpu_buf_tg > 0) {
+                memory->dkvt_sync_tg_compute_from_sched(sched.get(), gpu_buf_tg);
+            }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -694,19 +705,32 @@ void llama_context::sched_reserve() {
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=1)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg);
+        LLAMA_LOG_INFO("%s: graph nodes  = %d (with bs=%d), %d (with bs=%d)\n", __func__, n_nodes_pp, n_tokens, n_nodes_tg, n_tokens_tg);
     }
 
     if (n_splits_pp == n_splits_tg) {
         LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
     } else {
-        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
+        LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=%d)\n", __func__, n_splits_pp, n_tokens, n_splits_tg, n_tokens_tg);
     }
 
     const int64_t t_end_us = ggml_time_us();
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    if (memory && memory->get_dkvt_active()) {
+        size_t gpu_buf = 0;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (backend_buft[i] && ggml_backend_buft_is_host(backend_buft[i])) {
+                continue;
+            }
+            gpu_buf = std::max(gpu_buf, ggml_backend_sched_get_buffer_alloc_size(sched.get(), backend_ptrs[i]));
+        }
+        if (gpu_buf > 0) {
+            memory->dkvt_sync_pp_compute_from_sched(sched.get(), gpu_buf);
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -1721,24 +1745,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
-    if (batch_inp.n_tokens == 1 && memory && !memory->get_is_transcoded_tg()) {
-        void * stream = nullptr;
-        if (sched) {
-            int n_backends = ggml_backend_sched_get_n_backends(sched.get());
-            for (int i = 0; i < n_backends; ++i) {
-                ggml_backend_t backend = ggml_backend_sched_get_backend(sched.get(), i);
-                if (backend && ggml_backend_is_cuda(backend)) {
-                    stream = ggml_backend_cuda_get_stream(backend);
-                    break;
-                }
-            }
-        }
-        memory->transcode_to_tg(stream);
-        if (stream) {
-            ggml_cuda_stream_synchronize(stream);
-        }
-    }
-
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -1782,6 +1788,76 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    auto dkvt_transcode_before_graph = [&]() {
+        if (cparams.warmup || output_all) {
+            return;
+        }
+        if (!memory) {
+            throw std::runtime_error("DKVT transcode required but memory is null");
+        }
+        if (memory->get_is_transcoded_tg()) {
+            return;
+        }
+        LLAMA_LOG_WARN("%s: DKVT transcode triggered (n_tokens=%u, n_outputs=%u)\n",
+                       __func__, n_tokens_all, n_outputs_all);
+        void * stream = nullptr;
+        if (sched) {
+            const int n_backends = ggml_backend_sched_get_n_backends(sched.get());
+            for (int i = 0; i < n_backends; ++i) {
+                ggml_backend_t backend = ggml_backend_sched_get_backend(sched.get(), i);
+                if (backend && ggml_backend_is_cuda(backend)) {
+                    stream = ggml_backend_cuda_get_stream(backend);
+                    break;
+                }
+            }
+        }
+        memory->transcode_to_tg(stream);
+        if (cparams.ctx_other) {
+            llama_memory_t mem_dft = llama_get_memory(cparams.ctx_other);
+            if (mem_dft && mem_dft->get_dkvt_active()) {
+                mem_dft->transcode_to_tg(stream);
+            }
+        }
+        if (stream) {
+            ggml_cuda_stream_synchronize(stream);
+        }
+        if (!memory->get_is_transcoded_tg()) {
+            throw std::runtime_error("DKVT transcode_to_tg finished without is_transcoded_tg");
+        }
+        if (gf_res_prev) {
+            gf_res_prev->reset();
+        }
+        if (cparams.ctx_other) {
+            llama_context * ctx_other = cparams.ctx_other;
+            if (ctx_other && ctx_other->gf_res_prev) {
+                ctx_other->gf_res_prev->reset();
+            }
+        }
+    };
+
+    if (memory && memory->get_dkvt_active()) {
+        const llama_pos seq_pos_max_0 = memory->seq_pos_max(0);
+        const bool kv_has_data = (seq_pos_max_0 >= 0);
+        LLAMA_LOG_WARN("%s: DKVT check: seq_pos_max(0)=%d, n_tokens=%u, n_outputs=%u, kv_has_data=%d, is_transcoded_tg=%d\n",
+                       __func__, (int) seq_pos_max_0, n_tokens_all, n_outputs_all, (int) kv_has_data, (int) memory->get_is_transcoded_tg());
+        if (dkvt_should_reset_before_graph(
+                n_tokens_all, n_outputs_all,
+                memory->get_is_transcoded_tg(), kv_has_data)) {
+            memory->dkvt_reset();
+            if (gf_res_prev) {
+                gf_res_prev->reset();
+            }
+        } else if (dkvt_should_transcode_before_graph(
+                       n_tokens_all, n_outputs_all, kv_has_data)) {
+            dkvt_transcode_before_graph();
+        }
+        if (memory->get_is_transcoded_tg() && sched) {
+            if (llama_kv_cache * kv = memory->as_kv_cache()) {
+                kv->dkvt_apply_union_compute_cap(sched.get());
+            }
+        }
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -2425,8 +2501,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = save_n_outputs;
 
-    // 动态 KV 转码 (DKVT) 延迟初始化：图分配前，一键替换与重映射
-    if (memory) {
+    // DKVT union 仅在完整 reserve/alloc 时绑定；split_only 的探测图 batch=1 会低估 size_act_pp。
+    if (memory && !split_only) {
         memory->init_dkvt(cparams.n_ubatch, sched.get());
     }
 

@@ -43,6 +43,16 @@ uint64_t ggml_graph_next_uid(void);
 // required for mmap as gguf only guarantees 32-byte alignment
 #define TENSOR_ALIGNMENT 32
 
+// Maximum number of chunks a virtual buffer can hold.
+// A chunk is a concrete backend buffer; multiple chunks allow the allocator to
+// grow beyond a single allocation when a tensor does not fit the existing free blocks.
+#define GGML_VBUFFER_MAX_CHUNKS 16
+
+// Virtual buffer: a set of one or more backed buffers used by the graph allocator.
+struct vbuffer {
+    struct ggml_backend_buffer * chunks[GGML_VBUFFER_MAX_CHUNKS];
+};
+
 // static_assert should be a #define, but if it's not,
 // fall back to the _Static_assert C11 keyword.
 // if C99 - static_assert is noop
@@ -121,6 +131,21 @@ GGML_API void ggml_log_callback_default(enum ggml_log_level level, const char * 
 #define GGML_LOG_ERROR(...) ggml_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 #define GGML_LOG_DEBUG(...) ggml_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define GGML_LOG_CONT(...)  ggml_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
+
+// Permanent INFO log for large backend allocations (threshold 4 MiB).
+static inline void ggml_mem_log_large_alloc(const char * site, const char * buft_name, size_t size, const char * detail) {
+    const size_t threshold = 4ULL * 1024 * 1024;
+    if (size < threshold) {
+        return;
+    }
+    if (detail && detail[0]) {
+        GGML_LOG_INFO("%s: [MEM-ALLOC] buft=%s size=%.2f MiB (%zu B) %s\n",
+            site, buft_name, size / 1024.0 / 1024.0, size, detail);
+    } else {
+        GGML_LOG_INFO("%s: [MEM-ALLOC] buft=%s size=%.2f MiB (%zu B)\n",
+            site, buft_name, size / 1024.0 / 1024.0, size);
+    }
+}
 
 #define GGML_DEBUG 0
 

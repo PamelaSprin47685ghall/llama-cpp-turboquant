@@ -64,9 +64,14 @@ public:
     void dkvt_bind_pp() override;
     void dkvt_reset() override { if (mem_attn) mem_attn->dkvt_reset(); }
 
+    bool get_dkvt_active() const override { return mem_attn ? mem_attn->get_dkvt_active() : false; }
+
     bool get_is_transcoded_tg() const override { return mem_attn ? mem_attn->get_is_transcoded_tg() : false; }
 
     llama_kv_cache * as_kv_cache() override { return get_mem_attn(); }
+
+    void dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) override;
+    void dkvt_sync_tg_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) override;
 
     void clear(bool data) override;
 

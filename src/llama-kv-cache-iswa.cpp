@@ -93,6 +93,16 @@ void llama_kv_cache_iswa::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched)
     kv_swa ->init_dkvt(n_ubatch, sched);
 }
 
+void llama_kv_cache_iswa::dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) {
+    if (kv_base) kv_base->dkvt_sync_pp_compute_from_sched(sched, measured_bytes);
+    if (kv_swa)  kv_swa ->dkvt_sync_pp_compute_from_sched(sched, measured_bytes);
+}
+
+void llama_kv_cache_iswa::dkvt_sync_tg_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) {
+    if (kv_base) kv_base->dkvt_sync_tg_compute_from_sched(sched, measured_bytes);
+    if (kv_swa)  kv_swa ->dkvt_sync_tg_compute_from_sched(sched, measured_bytes);
+}
+
 void llama_kv_cache_iswa::transcode_to_tg(void * stream) {
     kv_base->transcode_to_tg(stream);
     kv_swa ->transcode_to_tg(stream);

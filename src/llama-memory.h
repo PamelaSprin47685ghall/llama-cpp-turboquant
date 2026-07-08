@@ -152,8 +152,14 @@ struct llama_memory_i {
     // DKVT: full reset — clear transcoded flag and rebind PP layout
     virtual void dkvt_reset() {}
 
+    // DKVT: whether this memory module owns or borrows an active union block
+    virtual bool get_dkvt_active() const { return false; }
+
     // DKVT: query whether transcode to TG-stage mixed precision has completed
     virtual bool get_is_transcoded_tg() const { return false; }
+
+    virtual void dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t /*sched*/, size_t /*measured_bytes*/) {}
+    virtual void dkvt_sync_tg_compute_from_sched(ggml_backend_sched_t /*sched*/, size_t /*measured_bytes*/) {}
 
     //
     // state write/read

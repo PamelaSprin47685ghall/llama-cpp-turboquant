@@ -92,8 +92,6 @@ enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_te
 
 // dynamic tensor allocator
 
-#define GGML_VBUFFER_MAX_CHUNKS 16
-
 // relative memory address within an allocation that can be split into multiple buffers (chunks)
 struct buffer_address {
     int chunk;     // index of a backend buffer
@@ -120,6 +118,7 @@ struct tallocr_chunk {
 struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
+    size_t cap; // 0 = unlimited; >0: hard ceiling on alloc offsets within chunk 0
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
 
@@ -260,6 +259,13 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     struct tallocr_chunk * chunk = alloc->chunks[best_fit_chunk];
     struct free_block    * block = &chunk->free_blocks[best_fit_block];
     struct buffer_address  addr  = {.chunk = best_fit_chunk, .offset = block->offset };
+
+    if (alloc->cap > 0 && addr.offset + size > alloc->cap) {
+        GGML_LOG_ERROR("%s: allocation of %s (%zu bytes at offset %zu) exceeds cap %zu\n",
+            __func__, tensor->name, size, addr.offset, alloc->cap);
+        GGML_ABORT("borrowed compute cap exceeded");
+    }
+
     block->offset += size;
     block->size -= size;
     if (block->size == 0) {
@@ -368,6 +374,7 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
     *alloc = (struct ggml_dyn_tallocr) {
         /*.alignment      = */ alignment,
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
+        /*.cap            = */ 0, // 0 = unlimited
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
 #ifdef GGML_ALLOCATOR_DEBUG
@@ -378,6 +385,10 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
     ggml_dyn_tallocr_reset(alloc);
 
     return alloc;
+}
+
+static void ggml_dyn_tallocr_set_cap(struct ggml_dyn_tallocr * alloc, size_t cap) {
+    alloc->cap = cap;
 }
 
 static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
@@ -393,10 +404,6 @@ static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chu
 
 
 // virtual buffer with contiguous memory range, split into multiple backend buffers (chunks)
-
-struct vbuffer {
-    ggml_backend_buffer_t chunks[GGML_VBUFFER_MAX_CHUNKS];
-};
 
 static void ggml_vbuffer_free(struct vbuffer * buf) {
     if (buf == NULL) {
@@ -428,6 +435,11 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        {
+            char detail[64];
+            snprintf(detail, sizeof(detail), "galloc chunk %d/%d", n, talloc->n_chunks);
+            ggml_mem_log_large_alloc("ggml_vbuffer_alloc", ggml_backend_buft_name(buft), chunk_size, detail);
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -483,6 +495,7 @@ struct ggml_gallocr {
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     bool * is_borrowed; // [n_buffers]
+    size_t * borrowed_compute_cap; // [n_buffers] 0 = no cap; >0: max compute offset
     int n_buffers;
 
     struct ggml_hash_set hash_set;
@@ -510,6 +523,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->is_borrowed = calloc(n_bufs, sizeof(bool));
     GGML_ASSERT(galloc->is_borrowed != NULL);
+
+    galloc->borrowed_compute_cap = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->borrowed_compute_cap != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -583,6 +599,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buffers);
     free(galloc->buf_tallocs);
     free(galloc->is_borrowed);
+    free(galloc->borrowed_compute_cap);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -861,6 +878,7 @@ static bool ggml_gallocr_reserve_n_impl(
     // reset allocators
     for (int i = 0; i < galloc->n_buffers; i++) {
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+        galloc->buf_tallocs[i]->cap = galloc->borrowed_compute_cap[i];
     }
 
     // allocate in hash table
@@ -942,15 +960,13 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-#ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-                }
+                char detail[128];
+                snprintf(detail, sizeof(detail), "gallocr backend_id=%d realloc from %.2f MiB borrowed=%d",
+                    i, cur_size / 1024.0 / 1024.0, galloc->is_borrowed ? (int) galloc->is_borrowed[i] : 0);
+                ggml_mem_log_large_alloc(__func__, ggml_backend_buft_name(galloc->bufts[i]), new_size, detail);
             }
-#endif
             if (galloc->is_borrowed && galloc->is_borrowed[i]) {
                 // borrowed buffer: do NOT free the vbuffer wrapper (shared pointer)
                 // just clear our reference to avoid double-free / dangling pointer
@@ -1158,6 +1174,20 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
 }
 
+size_t ggml_gallocr_get_buffer_alloc_size(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    if (galloc->buf_tallocs[buffer_id] == NULL) {
+        return 0;
+    }
+
+    size_t alloc_size = 0;
+    for (int c = 0; c < galloc->buf_tallocs[buffer_id]->n_chunks; c++) {
+        alloc_size += ggml_dyn_tallocr_max_size(galloc->buf_tallocs[buffer_id], c);
+    }
+    return alloc_size;
+}
+
 // utils
 
 static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {
@@ -1172,6 +1202,7 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
         ggml_backend_buffer_type_t buft, size_t size,
         ggml_backend_buffer_t ** buffers, size_t * n_buffers) {
 
+    ggml_mem_log_large_alloc(__func__, ggml_backend_buft_name(buft), size, "ctx tensor range");
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (buffer == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
@@ -1305,4 +1336,12 @@ void ggml_gallocr_set_borrowed(ggml_gallocr_t galloc, int buffer_id, bool borrow
 bool ggml_gallocr_is_borrowed(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
     return galloc->is_borrowed ? galloc->is_borrowed[buffer_id] : false;
+}
+
+void ggml_gallocr_set_borrowed_compute_cap(ggml_gallocr_t galloc, int buffer_id, size_t cap) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    galloc->borrowed_compute_cap[buffer_id] = cap;
+    // propagate cap to the underlying dyn_tallocr so that
+    // ggml_dyn_tallocr_alloc enforces the ceiling on every allocation
+    ggml_dyn_tallocr_set_cap(galloc->buf_tallocs[buffer_id], cap);
 }

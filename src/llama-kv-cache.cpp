@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-dkvt.h"
 
 #include "../ggml/src/ggml-quants.h"
 
@@ -132,7 +133,7 @@ llama_kv_cache::llama_kv_cache(
     other(mem_other ? mem_other->as_kv_cache() : nullptr),
     v_cells_impl(std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl),
-    is_transcoded_tg(false) {
+    is_transcoded_tg(false), is_mtp(is_mtp) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -326,56 +327,55 @@ llama_kv_cache::llama_kv_cache(
         //   7 = Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (K unchanged)
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
-        {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
+        // Per-instance (not static) to avoid leaking the layer-adaptive decision
+        // from a temporary measurement context (e.g. MTP draft fit-params) into
+        // the real target KV cache.
+        const int adaptive_mode = [&]() {
+            const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+            if (env) {
+                int mode = atoi(env);
+                if (mode > 0) {
+                    LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
                 }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
-                }
-                return 0;
-            }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-            const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
-            const uint32_t n_layer = hparams.n_layer();
-            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
-                if (il < 4 || il >= n_layer - 4) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
-                if (il >= n_layer - 8) {
-                    layer_type_k = GGML_TYPE_Q8_0;
-                    layer_type_v = GGML_TYPE_Q8_0;
-                }
-            } else if (adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
-                // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
-                const bool is_boundary = (il < 2 || il >= n_layer - 2);
-                layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
-                if (il == 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
-                }
-            } else if (adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
-                // V-only: last 8 V=turbo4, rest V=turbo2
-                layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
-                if (il == 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
-                }
-            } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
-                // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
-                const bool is_boundary = (il < 2 || il >= n_layer - 2);
-                layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
-                if (il == 0) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
-                }
+                return mode;
+            }
+            // Auto-enable disabled by default: turbo2-V already has enough memory pressure
+            // on 8GB cards and the boundary q8_0 fallback can push the target KV cache over
+            // the available VRAM when combined with an MTP draft context. Opt-in via env.
+            return 0;
+        }();
+        const bool is_turbo_type = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        const bool v_is_turbo_type = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+        const uint32_t n_layer = hparams.n_layer();
+        if (adaptive_mode == 1 && is_turbo_type && n_layer >= 8) {
+            if (il < 4 || il >= n_layer - 4) {
+                layer_type_k = GGML_TYPE_Q8_0;
+                layer_type_v = GGML_TYPE_Q8_0;
+            }
+        } else if (adaptive_mode == 2 && is_turbo_type && n_layer >= 8) {
+            if (il >= n_layer - 8) {
+                layer_type_k = GGML_TYPE_Q8_0;
+                layer_type_v = GGML_TYPE_Q8_0;
+            }
+        } else if (adaptive_mode == 5 && v_is_turbo_type && n_layer >= 8) {
+            // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2
+            const bool is_boundary = (il < 2 || il >= n_layer - 2);
+            layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
+            if (il == 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
+            }
+        } else if (adaptive_mode == 6 && v_is_turbo_type && n_layer >= 8) {
+            // V-only: last 8 V=turbo4, rest V=turbo2
+            layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
+            if (il == 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
+            }
+        } else if (adaptive_mode == 7 && v_is_turbo_type && n_layer >= 8) {
+            // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2
+            const bool is_boundary = (il < 2 || il >= n_layer - 2);
+            layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
+            if (il == 0) {
+                LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
             }
         }
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
@@ -617,6 +617,13 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
+    }
+
+    // MTP draft contexts (e.g. Qwen3.5/3.6 nextn blocks) have their own KV layers
+    // and must update their own v_cells.  Clear the other pointer after inheriting
+    // head dims / rotation policy so the cache is treated as independent.
+    if (is_mtp && other) {
+        other = nullptr;
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
@@ -1493,6 +1500,14 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::get_transcode_n_kv() const {
+    uint32_t result = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        result = std::max(result, dkvt_kv_rows_to_transcode(v_cells[s].used_max_p1(), v_cells[s].size(), n_pad));
+    }
+    return result;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1528,63 +1543,60 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (!has_layer(il)) {
+        return nullptr;
+    }
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_k_gqa = k->ne[0];
-
-    // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
+    const uint64_t kv_size = get_size();
     const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0);
-    if (k_is_turbo) {
-        assert(n_embd_k_gqa >= hparams.n_embd_k_gqa(il));
-    } else {
-        assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
-    }
-
-    // Use padded head_dim for turbo types so the full padded data is returned
     const uint32_t head_k = hparams.n_embd_head_k(il);
-    const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
+    const uint32_t n_embd_k_gqa_h = hparams.n_embd_k_gqa(il);
+    const uint64_t n_embd_k_row = k_is_turbo ? k->ne[0] : n_embd_k_gqa_h;
+    if (k_is_turbo) {
+        GGML_ASSERT(k->ne[0] >= n_embd_k_gqa_h);
+    } else {
+        GGML_ASSERT(k->ne[0] >= n_embd_k_gqa_h);
+    }
+    const uint32_t head_k_eff = k_is_turbo && (head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
-
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
             head_k_eff, hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, head_k_eff),
-            ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_row),
+            ggml_row_size(k->type, n_embd_k_row * kv_size),
+            ggml_row_size(k->type, n_embd_k_row * kv_size) * sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (!has_layer(il)) {
+        return nullptr;
+    }
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
 
-    const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_v_gqa = v->ne[0];
-
-    // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
-
-    // Use padded head_dim for turbo types
+    const uint64_t kv_size = get_size();
     const bool v_is_turbo = (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0);
     const uint32_t head_v = hparams.n_embd_head_v(il);
+    const uint32_t n_embd_v_gqa_h = hparams.n_embd_v_gqa(il);
+    const uint64_t n_embd_v_row = v_is_turbo ? v->ne[0] : n_embd_v_gqa_h;
+    GGML_ASSERT(v->ne[0] >= n_embd_v_gqa_h);
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
-
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
-        // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
                 head_v_eff, hparams.n_head_kv(il), n_kv, ns,
-                ggml_row_size(v->type, head_v_eff),                      // v->nb[1]
-                ggml_row_size(v->type, n_embd_v_gqa),                    // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),            // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, head_v_eff),
+                ggml_row_size(v->type, n_embd_v_row),
+                ggml_row_size(v->type, n_embd_v_row * kv_size),
+                ggml_row_size(v->type, n_embd_v_row * kv_size) * sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1592,13 +1604,16 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             n_kv, hparams.n_head_kv(il), head_v_eff, ns,
             ggml_row_size(v->type, kv_size*head_v_eff),              // v->nb[1]
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_row),            // v->nb[3]
+            ggml_row_size(v->type, kv_size*n_embd_v_row)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
+    if (!has_layer(il)) {
+        return k_cur;
+    }
     const int32_t ikv = map_layer_ids.at(il);
 
     ggml_tensor * k = layers[ikv].k;
@@ -1627,15 +1642,17 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
     const int64_t n_stream = k->ne[2];
+    const int64_t k_row_width = k_is_turbo ? k->ne[0] : (int64_t) hparams.n_embd_k_gqa(il);
 
     if (n_stream > 1) {
         const int64_t kv_size = get_size();
 
-        assert(n_embd_gqa == k->ne[0]);
-        assert(kv_size    == k->ne[1]);
+        GGML_ASSERT(n_embd_gqa == k_row_width);
+        GGML_ASSERT(kv_size    == k->ne[1]);
 
-        // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        k = ggml_reshape_2d(ctx, k, k_row_width, kv_size*n_stream);
+    } else {
+        GGML_ASSERT(n_embd_gqa == k_row_width);
     }
 
     // store the current K values into the cache
@@ -1654,6 +1671,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
+    if (!has_layer(il)) {
+        return v_cur;
+    }
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1679,17 +1699,21 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_stream = v->ne[2];
 
     // take this branch when FA is enabled (the V cache is not transposed)
+    const int64_t v_row_width = v_is_turbo ? v->ne[0] : (int64_t) hparams.n_embd_v_gqa(il);
+
     if (!v_trans) {
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
 
-            assert(n_embd_gqa == v->ne[0]);
-            assert(kv_size    == v->ne[1]);
+            GGML_ASSERT(n_embd_gqa == v_row_width);
+            GGML_ASSERT(kv_size    == v->ne[1]);
 
             // merge the buffer across all streams because the idxs are global
-            v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+            v = ggml_reshape_2d(ctx, v, v_row_width, kv_size*n_stream);
+        } else {
+            GGML_ASSERT(n_embd_gqa == v_row_width);
         }
 
         ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
@@ -2938,10 +2962,16 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
+    if (!kv || !kv->has_layer(il)) {
+        return nullptr;
+    }
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
+    if (!kv || !kv->has_layer(il)) {
+        return nullptr;
+    }
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 

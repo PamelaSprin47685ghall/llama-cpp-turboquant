@@ -207,7 +207,7 @@ int test_companion_offset_sync() {
     main_cache.union_size = mock_union_size;
 
     // 计算每层尺寸和偏移
-    main_cache.init_dkvt_sum_kv_sizes();
+    main_cache.init_dkvt_sum_kv_sizes(1);
     main_cache.dkvt_bind_pp();
 
     printf("  main_cache: layers=%zu, dkvt_k_size_pp=%zu, dkvt_v_size_pp=%zu, "
@@ -307,14 +307,41 @@ int test_companion_offset_sync() {
     }
     printf("  PP bind pointer match: PASSED\n");
 
-    // 校验 5：PP 绑定后，相邻层 K 指针差 == 前一层 k_size_pp（紧密排列无间隙）
+    // 校验 4b：主已 TG 后伴生 decode 路径须 transcode_to_tg 本地绑定（非委托 get_is_transcoded）
+    void * companion_pp_k0 = companion_cache.layers[0].k->data;
+    main_cache.is_transcoded_tg = true;
+    main_cache.dkvt_bind_tg();
+    companion_cache.is_transcoded_tg = false;
+    companion_cache.transcode_to_tg(nullptr);
+    if (!companion_cache.is_transcoded_tg) {
+        fprintf(stderr, "FAIL: companion transcode_to_tg must set local flag\n");
+        llama_model_free(model);
+        return 1;
+    }
+    if (companion_cache.layers[0].k->data == companion_pp_k0) {
+        fprintf(stderr, "FAIL: companion still on PP bind after parent TG\n");
+        llama_model_free(model);
+        return 1;
+    }
+    if (companion_cache.layers[0].k->data != main_cache.layers[0].k->data) {
+        fprintf(stderr, "FAIL: companion TG K must alias parent\n");
+        llama_model_free(model);
+        return 1;
+    }
+    printf("  companion transcode_to_tg after parent TG: PASSED\n");
+
+    // 校验 5：相邻层步长与当前布局一致（4b 后伴生为 TG，用 k_size_tg / v_size_tg）
+    const bool layout_tg = companion_cache.is_transcoded_tg;
     for (size_t i = 1; i < companion_cache.layers.size(); ++i) {
         if (companion_cache.layers[i].k && companion_cache.layers[i - 1].k) {
             ptrdiff_t diff = (char *)companion_cache.layers[i].k->data -
                              (char *)companion_cache.layers[i - 1].k->data;
-            if (diff != (ptrdiff_t)companion_cache.layers[i - 1].k_size_pp) {
-                fprintf(stderr, "FAIL: layer %zu K pointer diff %td != k_size_pp %zu\n",
-                        i, diff, companion_cache.layers[i - 1].k_size_pp);
+            const size_t k_step = layout_tg
+                ? companion_cache.layers[i - 1].k_size_tg
+                : companion_cache.layers[i - 1].k_size_pp;
+            if (diff != (ptrdiff_t) k_step) {
+                fprintf(stderr, "FAIL: layer %zu K pointer diff %td != k_step %zu\n",
+                        i, diff, k_step);
                 llama_model_free(model);
                 return 1;
             }
@@ -322,9 +349,12 @@ int test_companion_offset_sync() {
         if (companion_cache.layers[i].v && companion_cache.layers[i - 1].v) {
             ptrdiff_t diff = (char *)companion_cache.layers[i].v->data -
                              (char *)companion_cache.layers[i - 1].v->data;
-            if (diff != (ptrdiff_t)companion_cache.layers[i - 1].v_size_pp) {
-                fprintf(stderr, "FAIL: layer %zu V pointer diff %td != v_size_pp %zu\n",
-                        i, diff, companion_cache.layers[i - 1].v_size_pp);
+            const size_t v_step = layout_tg
+                ? companion_cache.layers[i - 1].v_size_tg
+                : companion_cache.layers[i - 1].v_size_pp;
+            if (diff != (ptrdiff_t) v_step) {
+                fprintf(stderr, "FAIL: layer %zu V pointer diff %td != v_step %zu\n",
+                        i, diff, v_step);
                 llama_model_free(model);
                 return 1;
             }
@@ -541,7 +571,7 @@ int test_dkvt_clear_resets_layout() {
     cache.union_size = union_size;
 
     // We must manually trigger sum sizes to populate offset caches
-    cache.init_dkvt_sum_kv_sizes();
+    cache.init_dkvt_sum_kv_sizes(1);
     cache.dkvt_bind_pp();
 
     // Verify it is initial PP layout
@@ -742,7 +772,7 @@ int test_dkvt_companion_layout_sync_after_parent_reset() {
     parent_kv->union_size = union_size;
 
     // 初始化 DKVT：计算偏移并绑定 PP 布局
-    parent_kv->init_dkvt_sum_kv_sizes();
+    parent_kv->init_dkvt_sum_kv_sizes(1);
     parent_kv->dkvt_bind_pp();
 
     void * initial_k0 = parent_kv->layers[0].k->data;
@@ -919,7 +949,7 @@ int test_non_dkvt_context_bypasses_binding() {
     main_cache.union_size = union_size;
 
     // 初始化 DKVT 并绑定 PP 布局
-    main_cache.init_dkvt_sum_kv_sizes();
+    main_cache.init_dkvt_sum_kv_sizes(1);
     main_cache.dkvt_bind_pp();
 
     void * initial_k0 = main_cache.layers[0].k->data;
@@ -944,6 +974,12 @@ int test_non_dkvt_context_bypasses_binding() {
 
     // 记录伴生上下文初始状态
     bool companion_initial_is_transcoded = companion_cache.is_transcoded_tg;
+    if (companion_initial_is_transcoded) {
+        fprintf(stderr,
+                "FAIL: companion initial is_transcoded_tg should be false\n");
+        llama_model_free(model);
+        return 1;
+    }
     void * companion_initial_k0 = companion_cache.layers[0].k->data;
     void * companion_initial_v0 = companion_cache.layers[0].v->data;
 
@@ -954,8 +990,9 @@ int test_non_dkvt_context_bypasses_binding() {
     // 模拟伴生上下文接收到自回归转码指令（例如在 MTP 推理中调用 decode）
     companion_cache.transcode_to_tg(nullptr);
 
-    // 调用伴生上下文的 get_is_transcoded_tg()
-    // 由于 other != nullptr，此方法委托给 other->get_is_transcoded_tg()
+    // 调用伴生上下文的 get_is_transcoded_tg()：
+    // 该方法只返回本上下文自己的转码标志。非 DKVT 伴生上下文没有 union buffer，
+    // 因此应保持 false，不应委托到父上下文。
     bool companion_reported_transcoded =
         companion_cache.get_is_transcoded_tg();
 
@@ -995,15 +1032,14 @@ int test_non_dkvt_context_bypasses_binding() {
     }
     printf("  companion vram_union_block stays nullptr: PASSED\n");
 
-    // 校验 4：get_is_transcoded_tg() 委托给 parent 返回 true
-    // 这是预期行为——伴生上下文通过多态查询感知主上下文状态
-    if (!companion_reported_transcoded) {
+    // 校验 4：非 DKVT 伴生仅报告本地标志（不委托父级），decode 门控与布局解耦
+    if (companion_reported_transcoded) {
         fprintf(stderr,
-                "FAIL: get_is_transcoded_tg() should delegate to parent\n");
+                "FAIL: non-DKVT companion get_is_transcoded_tg must stay local false\n");
         llama_model_free(model);
         return 1;
     }
-    printf("  get_is_transcoded_tg() delegates to parent: PASSED\n");
+    printf("  non-DKVT companion local is_transcoded_tg=false: PASSED\n");
 
     // 校验 5：伴生上下文的 dkvt 尺寸字段应保持零
     if (companion_cache.dkvt_k_size_pp != 0 ||
@@ -1032,6 +1068,76 @@ int test_non_dkvt_context_bypasses_binding() {
     return 0;
 }
 
+int test_mtp_shared_child_preserves_parent_ext_flags() {
+    printf("=== test_mtp_shared_child_preserves_parent_ext_flags ===\n");
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.use_extra_bufts = false;
+    llama_model * model = llama_model_create(LLM_ARCH_LLAMA, model_params);
+    if (!model) {
+        fprintf(stderr, "FAIL: could not create llama_model\n");
+        return 1;
+    }
+
+    model->hparams.n_layer_all = 2;
+    model->hparams.n_embd = 256;
+    model->hparams.n_embd_head_k_full = 128;
+    model->hparams.n_embd_head_v_full = 128;
+    model->hparams.n_layer_kv_from_start = -1;
+    for (uint32_t i = 0; i < model->hparams.n_layer_all; ++i) {
+        model->hparams.n_head_arr[i] = 2;
+        model->hparams.n_head_kv_arr[i] = 2;
+    }
+
+    const uint32_t kv_size = 256;
+    llama_kv_cache parent_cache(
+        *model, model->hparams,
+        GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0,
+        false, false, true,
+        kv_size, 1, 1, 0,
+        LLAMA_SWA_TYPE_NONE,
+        nullptr, nullptr, nullptr, nullptr);
+
+    if (!(parent_cache.layers[0].k->flags & GGML_TENSOR_FLAG_EXT) ||
+        !(parent_cache.layers[0].v->flags & GGML_TENSOR_FLAG_EXT)) {
+        fprintf(stderr, "FAIL: parent turbo cache should start with EXT K/V\n");
+        llama_model_free(model);
+        return 1;
+    }
+
+    auto share_first_layer = [](int32_t il) -> int32_t {
+        return il == 0 ? 0 : -1;
+    };
+
+    llama_kv_cache child_cache(
+        *model, model->hparams,
+        GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0,
+        false, false, true,
+        kv_size, 1, 1, 0,
+        LLAMA_SWA_TYPE_NONE,
+        (llama_memory_t)&parent_cache,
+        nullptr, nullptr, share_first_layer,
+        true);
+
+    if (!(parent_cache.layers[0].k->flags & GGML_TENSOR_FLAG_EXT) ||
+        !(parent_cache.layers[0].v->flags & GGML_TENSOR_FLAG_EXT)) {
+        fprintf(stderr, "FAIL: MTP child construction cleared parent EXT flags\n");
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (child_cache.layers[0].k != parent_cache.layers[0].k ||
+        child_cache.layers[0].v != parent_cache.layers[0].v) {
+        fprintf(stderr, "FAIL: child should share parent first layer tensors\n");
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_model_free(model);
+    printf("  test_mtp_shared_child_preserves_parent_ext_flags PASSED\n");
+    return 0;
+}
+
 int main() {
     int failures = 0;
     failures += test_companion_sync();
@@ -1043,5 +1149,6 @@ int main() {
     failures += test_dkvt_clear_resets_layout();
     failures += test_dkvt_companion_layout_sync_after_parent_reset();
     failures += test_non_dkvt_context_bypasses_binding();
+    failures += test_mtp_shared_child_preserves_parent_ext_flags();
     return failures == 0 ? 0 : 1;
 }

@@ -118,7 +118,9 @@ public:
     void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
     void disable_dkvt_ext_flags() override;
 
-    bool get_is_transcoded_tg() const override { return other ? other->get_is_transcoded_tg() : is_transcoded_tg; }
+    bool get_dkvt_active() const override { return vram_union_block != nullptr; }
+
+    bool get_is_transcoded_tg() const override { return is_transcoded_tg; }
 
     llama_kv_cache * as_kv_cache() override { return this; }
     const llama_kv_cache * get_other() const { return other; }
@@ -164,6 +166,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_transcode_n_kv() const;
 
     bool get_has_shift() const;
 
@@ -316,6 +319,7 @@ private:
     stream_copy_info sc_info;
 
     bool is_transcoded_tg = false;
+    bool is_mtp = false;
 
     size_t size_act_pp = 0;
     size_t size_act_tg = 0;
@@ -325,11 +329,15 @@ private:
     char * ptr_start = nullptr;
     char * ptr_end = nullptr;
     size_t union_size = 0;
+    size_t dkvt_gpu_alignment = 0;
     bool owns_union_block = false;
     size_t dkvt_k_size_pp = 0;
     size_t dkvt_k_size_tg = 0;
     size_t dkvt_v_size_pp = 0;
     size_t dkvt_v_size_tg = 0;
+    // Weak reference to scheduler + buffer_id for compute cap control
+    ggml_backend_sched_t dkvt_sched = nullptr;
+    int dkvt_sched_buffer_id = -1;
 
     std::vector<kv_layer> layers;
 
@@ -378,14 +386,14 @@ private:
     // DKVT private helpers for decomposition
     void init_dkvt_borrow();
     bool init_dkvt_find_backend(ggml_backend_sched_t sched, ggml_backend_buffer_type_t & buft, int & buffer_id);
-    void init_dkvt_sum_kv_sizes();
+    void init_dkvt_sum_kv_sizes(size_t gpu_alignment);
     bool init_dkvt_alloc(ggml_backend_buffer_type_t buft);
     void init_dkvt_bind_layers(ggml_backend_sched_t sched, int buffer_id);
     void init_dkvt_compute_activation_size(size_t n_ubatch);
 
-    void transcode_to_tg_cuda(void * stream);
-    void transcode_to_tg_cuda_k(const char * k_src_base, char * k_dst_base, void * stream);
-    void transcode_to_tg_cuda_v(const char * v_src_base, char * v_dst_base, void * stream);
+    bool transcode_to_tg_cuda(void * stream);
+    bool transcode_to_tg_cuda_k(const char * k_src_base, char * k_dst_base, void * stream);
+    bool transcode_to_tg_cuda_v(const char * v_src_base, char * v_dst_base, void * stream);
     void transcode_to_tg_cpu();
     void dkvt_bind_tg();
 
@@ -394,11 +402,15 @@ private:
     friend int test_dkvt_clear_resets_layout();
     friend int test_dkvt_companion_layout_sync_after_parent_reset();
     friend int test_non_dkvt_context_bypasses_binding();
+    friend int test_mtp_shared_child_preserves_parent_ext_flags();
 
 public:
     void transcode_to_tg(void * stream) override;
     void dkvt_bind_pp() override;
     void dkvt_reset() override;
+    void dkvt_apply_union_compute_cap(ggml_backend_sched_t sched) const;
+    void dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes);
+    void dkvt_sync_tg_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

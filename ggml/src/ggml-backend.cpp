@@ -41,6 +41,7 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t 
         // return a dummy buffer for zero-sized allocations
         return ggml_backend_buffer_init(buft, {}, NULL, 0);
     }
+    ggml_mem_log_large_alloc(__func__, ggml_backend_buft_name(buft), size, nullptr);
     return buft->iface.alloc_buffer(buft, size);
 }
 
@@ -1843,6 +1844,9 @@ void ggml_backend_sched_share_buffers(ggml_backend_sched_t dst, ggml_backend_sch
         }
         ggml_gallocr_set_buffer(dst->galloc, i, src_buf);
         ggml_gallocr_set_borrowed(dst->galloc, i, true);
+        const size_t sz = ggml_gallocr_get_buffer_size(dst->galloc, i);
+        ggml_mem_log_large_alloc(__func__, ggml_backend_buft_name(dst->bufts[i]), sz,
+            "MTP share_compute_buffers_with (borrowed)");
     }
 }
 
@@ -1985,6 +1989,14 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+size_t ggml_backend_sched_get_buffer_alloc_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return ggml_gallocr_get_buffer_alloc_size(sched->galloc, backend_index);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
@@ -2336,6 +2348,7 @@ static const char * ggml_backend_cpu_buffer_type_get_name(ggml_backend_buffer_ty
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_mem_log_large_alloc(__func__, "CPU", size, nullptr);
     void * data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
@@ -2403,25 +2416,32 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) 
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
 }
 
-struct vbuffer {
-    ggml_backend_buffer_t chunks[16]; // 16 matches GGML_VBUFFER_MAX_CHUNKS
-};
-
 void ggml_backend_sched_set_custom_buffer(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_t buf) {
     GGML_ASSERT(sched);
     GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
-    
+
     struct vbuffer * old_buf = (struct vbuffer *)ggml_gallocr_get_buffer(sched->galloc, backend_id);
     if (old_buf) {
         if (!ggml_gallocr_is_borrowed(sched->galloc, backend_id)) {
             ggml_gallocr_free_buffer((struct vbuffer *)old_buf);
         }
     }
-    
+
     struct vbuffer * custom_vbuf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
-    if (custom_vbuf) {
-        custom_vbuf->chunks[0] = buf;
-        ggml_gallocr_set_buffer(sched->galloc, backend_id, custom_vbuf);
-        ggml_gallocr_set_borrowed(sched->galloc, backend_id, true);
+    if (!custom_vbuf) {
+        GGML_LOG_ERROR("%s: failed to allocate vbuffer for custom buffer\n", __func__);
+        return;
     }
+    custom_vbuf->chunks[0] = buf;
+    ggml_gallocr_set_buffer(sched->galloc, backend_id, custom_vbuf);
+    ggml_gallocr_set_borrowed(sched->galloc, backend_id, true);
+    const size_t sz = ggml_backend_buffer_get_size(buf);
+    ggml_mem_log_large_alloc(__func__, ggml_backend_buft_name(sched->bufts[backend_id]), sz,
+        "sched custom buffer (borrowed, DKVT union)");
+}
+
+void ggml_backend_sched_set_borrowed_compute_cap(ggml_backend_sched_t sched, int backend_id, size_t cap_bytes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
+    ggml_gallocr_set_borrowed_compute_cap(sched->galloc, backend_id, cap_bytes);
 }

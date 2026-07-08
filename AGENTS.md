@@ -95,6 +95,8 @@ numactl --interleave=all taskset -c 0-15 ./build/bin/llama-cli \
     --spec-draft-n-max 3 \
     --spec-draft-p-min 0.0 \
     --spec-draft-n-min 0 \
+    --spec-draft-type-k turbo4 \
+    --spec-draft-type-v turbo2 \
     -st
 ```
 
@@ -135,11 +137,14 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ -x "${FRPC_BIN}" ]]; then
-    mkdir -p "$(dirname "${FRPC_CONF}")"
-    cat > "${FRPC_CONF}" <<EOF
+    if [[ -z "${FRPC_AUTH_TOKEN:-}" ]]; then
+        echo "[start] 警告: 未设置 FRPC_AUTH_TOKEN，跳过 frp 公网穿透" >&2
+    else
+        mkdir -p "$(dirname "${FRPC_CONF}")"
+        cat > "${FRPC_CONF}" <<EOF
 serverAddr = "ai.kw92.cyou"
 serverPort = 7000
-auth.token = "40a4c80c057d1c07e4bdcb8520f26c21"
+auth.token = "${FRPC_AUTH_TOKEN}"
 
 [[proxies]]
 name = "ornith_prod"
@@ -148,10 +153,11 @@ localIP = "127.0.0.1"
 localPort = ${PORT}
 remotePort = 8000
 EOF
-    chmod 600 "${FRPC_CONF}"
-    "${FRPC_BIN}" -c "${FRPC_CONF}" &
-    FRPC_PID=$!
-    echo "[start] frpc 隧道已建立: 127.0.0.1:${PORT} -> ai.kw92.cyou:8000" >&2
+        chmod 600 "${FRPC_CONF}"
+        "${FRPC_BIN}" -c "${FRPC_CONF}" &
+        FRPC_PID=$!
+        echo "[start] frpc 隧道已建立: 127.0.0.1:${PORT} -> ai.kw92.cyou:8000" >&2
+    fi
 else
     echo "[start] 警告: 未找到 ${FRPC_BIN} 可执行文件，跳过 frp 公网穿透" >&2
 fi
@@ -176,5 +182,7 @@ numactl --interleave=all taskset -c "${CORES}" "${DIR}/build/bin/llama-server" \
     --spec-type draft-mtp \
     --spec-draft-n-max 3 \
     --spec-draft-p-min 0.0 \
-    --spec-draft-n-min 0
+    --spec-draft-n-min 0 \
+    --spec-draft-type-k turbo4 \
+    --spec-draft-type-v turbo2
 ```

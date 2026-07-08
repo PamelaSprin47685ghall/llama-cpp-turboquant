@@ -2622,8 +2622,15 @@ ggml_tensor * llm_graph_context::build_attn(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (mctx_cur && mctx_cur->has_layer(il)) {
+        k = mctx_cur->get_k(ctx0, il);
+        v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    } else {
+        k = k_cur;
+        v = v_cur;
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -2701,8 +2708,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = (mctx_cur && mctx_cur->has_layer(il)) ? mctx_cur->get_k(ctx0, il) : k_cur;
+    ggml_tensor * v = (mctx_cur && mctx_cur->has_layer(il)) ? mctx_cur->get_v(ctx0, il) : v_cur;
 
     // TurboQuant: pre-rotate Q for ISWA attention (pad to 128-aligned if needed)
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {

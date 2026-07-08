@@ -144,6 +144,14 @@ void llama_memory_hybrid_iswa::init_dkvt(size_t n_ubatch, ggml_backend_sched_t s
     if (mem_attn) mem_attn->init_dkvt(n_ubatch, sched);
 }
 
+void llama_memory_hybrid_iswa::dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) {
+    if (mem_attn) mem_attn->dkvt_sync_pp_compute_from_sched(sched, measured_bytes);
+}
+
+void llama_memory_hybrid_iswa::dkvt_sync_tg_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) {
+    if (mem_attn) mem_attn->dkvt_sync_tg_compute_from_sched(sched, measured_bytes);
+}
+
 void llama_memory_hybrid_iswa::transcode_to_tg(void * stream) {
     if (mem_attn) mem_attn->transcode_to_tg(stream);
 }

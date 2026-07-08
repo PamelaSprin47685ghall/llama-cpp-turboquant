@@ -72,12 +72,21 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+// Returns the high-water allocation size used inside a buffer (sum of the allocator chunk max sizes),
+// which for a borrowed DKVT union buffer is the actual compute size, not the total backend buffer size.
+GGML_API size_t ggml_gallocr_get_buffer_alloc_size(ggml_gallocr_t galloc, int buffer_id);
 struct vbuffer;
 GGML_API struct vbuffer * ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id);
 GGML_API void             ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id, struct vbuffer * buffer);
 GGML_API void             ggml_gallocr_free_buffer(struct vbuffer * buffer);
 GGML_API void             ggml_gallocr_set_borrowed(ggml_gallocr_t galloc, int buffer_id, bool borrowed);
 GGML_API bool             ggml_gallocr_is_borrowed(ggml_gallocr_t galloc, int buffer_id);
+// Set a hard ceiling on compute allocation offsets for a borrowed buffer.
+// When cap > 0 and the buffer is borrowed, ggml_dyn_tallocr_alloc will
+// abort if any tensor's end offset would exceed cap. This prevents the
+// compute graph from growing into the KV region of a union buffer.
+// Pass 0 to disable the cap. Must be called before ggml_gallocr_reserve.
+GGML_API void             ggml_gallocr_set_borrowed_compute_cap(ggml_gallocr_t galloc, int buffer_id, size_t compute_cap_bytes);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

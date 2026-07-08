@@ -293,8 +293,8 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);
                 cb(indexer_weights, "indexer_weights", il);
 
-                // get cached indexer keys
-                indexer_k = mctx_lid->get_k(ctx0, il);
+                // get cached indexer keys (skip if the companion context does not own this layer)
+                indexer_k = (mctx_lid && mctx_lid->has_layer(il)) ? mctx_lid->get_k(ctx0, il) : indexer_k;
 
                 // split the batch into streams if needed
                 const auto n_stream = indexer_k->ne[3];

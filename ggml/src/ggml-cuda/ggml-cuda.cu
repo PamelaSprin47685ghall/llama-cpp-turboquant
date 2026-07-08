@@ -865,6 +865,12 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 
+    {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "device=%d cudaMalloc ok", buft_ctx->device);
+        ggml_mem_log_large_alloc(__func__, buft_ctx->name.c_str(), size, detail);
+    }
+
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

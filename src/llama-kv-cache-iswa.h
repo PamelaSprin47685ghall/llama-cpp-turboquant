@@ -53,6 +53,10 @@ public:
     void transcode_to_tg(void * stream) override;
     void dkvt_bind_pp() override;
     void dkvt_reset() override { if (kv_base) kv_base->dkvt_reset(); if (kv_swa) kv_swa->dkvt_reset(); }
+    void dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) override;
+    void dkvt_sync_tg_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) override;
+
+    bool get_dkvt_active() const override { return kv_base ? kv_base->get_dkvt_active() : false; }
 
     bool get_is_transcoded_tg() const override { return kv_base ? kv_base->get_is_transcoded_tg() : false; }
 

@@ -122,6 +122,25 @@ static __device__ __forceinline__ void turbo_fwht_64(float * x) {
     }
 }
 
+// Inverse Turbo WHT on 128 floats in __shared__ (matches ggml_turbo_wht direction=1, no InnerQ scale).
+static __device__ __forceinline__ void turbo_wht_inverse_128_shared(float * x, int tid) {
+    x[tid] *= TURBO_WHT_SIGNS2[tid];
+    __syncthreads();
+#define DKVT_WHT_STAGE(h) \
+    if (tid % (2 * (h)) < (h)) { float a = x[tid], b = x[tid + (h)]; x[tid] = a + b; x[tid + (h)] = a - b; } \
+    __syncthreads();
+    DKVT_WHT_STAGE(1)
+    DKVT_WHT_STAGE(2)
+    DKVT_WHT_STAGE(4)
+    DKVT_WHT_STAGE(8)
+    DKVT_WHT_STAGE(16)
+    DKVT_WHT_STAGE(32)
+    DKVT_WHT_STAGE(64)
+#undef DKVT_WHT_STAGE
+    constexpr float inv_sqrt = 0.08838834764831845f;
+    x[tid] = x[tid] * inv_sqrt * TURBO_WHT_SIGNS1[tid];
+}
+
 // ---- Forward rotation: signs1 → FWHT → signs2 ----
 
 static __device__ __forceinline__ void turbo_rotate_forward(float * x) {

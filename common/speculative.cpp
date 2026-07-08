@@ -901,7 +901,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // The MTP draft context always has its own KV cache (the nextn block)
+        // even if ctx_other is set to the target for compute-buffer sharing.
+        // Treat it as non-shared so process() fills the draft KV and draft()
+        // uses increasing positions.
+        is_mem_shared = false;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 

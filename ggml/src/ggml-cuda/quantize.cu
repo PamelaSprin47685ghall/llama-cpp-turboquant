@@ -451,45 +451,90 @@ void quantize_mmq_fp4_cuda(
 }
 
 // 动态 KV 转码 (DKVT) GPU 显存原位转码核函数与 C 接口
+//
+// 每个 kernel 处理一个 "KV row × head group" 的转码单元。
+// grid 维度 = n_kv_rows * groups_per_row，其中 groups_per_row = head_size / 128。
+// blockIdx.x 分解为 row = ib / groups_per_row, grp = ib % groups_per_row。
+// 使用字节步长 src_row_stride / dst_row_stride 支持非紧凑布局（v_trans 等）。
+
 __global__ void transcode_k_turbo4_to_f16_kernel(
-    const block_turbo4_0 * __restrict__ src,
-    half *                 __restrict__ dst,
+    const char *           __restrict__ src,
+    char *                 __restrict__ dst,
     const int64_t          head_size_k,
-    const int64_t          kv_size) 
+    const int64_t          n_kv_rows,
+    const int64_t          groups_per_row,
+    const int64_t          src_row_stride,
+    const int64_t          dst_row_stride)
 {
     const int64_t ib = blockIdx.x;
     const int tid = threadIdx.x;
 
-    if (ib >= kv_size * (head_size_k / 128)) return;
+    if (ib >= n_kv_rows * groups_per_row) return;
 
-    const float norm = __half2float(src[ib].norm);
-    float val = turbo4_dequant_element(&src[ib], tid, norm);
-    dst[ib * 128 + tid] = __float2half(val);
+    const int64_t row = ib / groups_per_row;
+    const int64_t grp = ib % groups_per_row;
+
+    const block_turbo4_0 * src_block = (const block_turbo4_0 *)(src + row * src_row_stride + grp * sizeof(block_turbo4_0));
+    const float norm = __half2float(src_block->norm);
+
+    __shared__ float x[128];
+    x[tid] = turbo4_dequant_element(src_block, tid, norm);
+    turbo_wht_inverse_128_shared(x, tid);
+
+    half * dst_row_ptr = (half *)(dst + row * dst_row_stride + grp * 128 * sizeof(half));
+    dst_row_ptr[tid] = __float2half(x[tid]);
 }
 
 __global__ void transcode_k_turbo2_to_f16_kernel(
-    const block_turbo2_0 * __restrict__ src,
-    half *                 __restrict__ dst,
+    const char *           __restrict__ src,
+    char *                 __restrict__ dst,
     const int64_t          head_size_k,
-    const int64_t          kv_size)
+    const int64_t          n_kv_rows,
+    const int64_t          groups_per_row,
+    const int64_t          src_row_stride,
+    const int64_t          dst_row_stride)
 {
     const int64_t ib = blockIdx.x;
     const int tid = threadIdx.x;
 
-    if (ib >= kv_size * (head_size_k / 128)) return;
+    if (ib >= n_kv_rows * groups_per_row) return;
 
-    const float norm = __half2float(src[ib].norm);
-    float val = turbo2_dequant_element(&src[ib], tid, norm);
-    dst[ib * 128 + tid] = __float2half(val);
+    const int64_t row = ib / groups_per_row;
+    const int64_t grp = ib % groups_per_row;
+
+    // turbo2: each 128-element rotation group is one block_turbo2_0
+    const block_turbo2_0 * src_block = (const block_turbo2_0 *)(
+        src + row * src_row_stride + grp * sizeof(block_turbo2_0));
+
+    __shared__ float x[128];
+    const float norm = __half2float(src_block->norm);
+    x[tid] = turbo2_dequant_element(src_block, tid, norm);
+    turbo_wht_inverse_128_shared(x, tid);
+
+    half * dst_row_ptr = (half *)(dst + row * dst_row_stride + grp * 128 * sizeof(half));
+    dst_row_ptr[tid] = __float2half(x[tid]);
 }
 
 extern "C" void ggml_cuda_transcode_k(
     const void * src, void * dst,
-    int64_t head_size_k, int64_t kv_size, int type_k, void * stream);
+    int64_t head_size_k, int64_t n_kv_rows,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_k, void * stream);
+
+// 单 row 粒度转码：仅转码一个 KV row 的所有 head groups。
+// grid = groups_per_row, block = 128 threads。
+// src/dst 指针已经由 host 按 row 偏移，此处不再做 row 维度的分解。
+extern "C" void ggml_cuda_transcode_k_row(
+    const void * src_row, void * dst_row,
+    int64_t head_size_k,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_k, void * stream);
 
 extern "C" void ggml_cuda_transcode_v(
     const void * src, void * dst,
-    int64_t head_size_v, int64_t kv_size, int type_v, void * stream);
+    int64_t head_size_v, int64_t n_kv_rows,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_v, void * stream);
 
 extern "C" void ggml_cuda_device_to_device_copy_async(
     void * dst, const void * src, size_t size, void * stream);
@@ -498,38 +543,75 @@ extern "C" void ggml_cuda_stream_synchronize(void * stream);
 
 extern "C" void ggml_cuda_transcode_k(
     const void * src, void * dst,
-    int64_t head_size_k, int64_t kv_size, int type_k, void * stream)
+    int64_t head_size_k, int64_t n_kv_rows,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_k, void * stream)
 {
     cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+    int64_t groups_per_row = head_size_k / 128;
+    int64_t num_blocks = n_kv_rows * groups_per_row;
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(num_blocks, 1, 1);
 
     if (type_k == GGML_TYPE_TURBO4_0) {
-        int64_t num_blocks = kv_size * (head_size_k / 128);
-        dim3 block_size(128, 1, 1);
-        dim3 grid_size(num_blocks, 1, 1);
         transcode_k_turbo4_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-            (const block_turbo4_0 *)src, (half *)dst, head_size_k, kv_size);
-    } else     if (type_k == GGML_TYPE_TURBO2_0) {
-        int64_t num_blocks = kv_size * (head_size_k / 128);
-        dim3 block_size(128, 1, 1);
-        dim3 grid_size(num_blocks, 1, 1);
+            (const char *)src, (char *)dst, head_size_k, n_kv_rows,
+            groups_per_row, src_row_stride, dst_row_stride);
+    } else if (type_k == GGML_TYPE_TURBO2_0) {
         transcode_k_turbo2_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-            (const block_turbo2_0 *)src, (half *)dst, head_size_k, kv_size);
+            (const char *)src, (char *)dst, head_size_k, n_kv_rows,
+            groups_per_row, src_row_stride, dst_row_stride);
+    }
+}
+
+extern "C" void ggml_cuda_transcode_k_row(
+    const void * src_row, void * dst_row,
+    int64_t head_size_k,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_k, void * stream)
+{
+    cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+    int64_t groups_per_row = head_size_k / 128;
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(groups_per_row, 1, 1);
+
+    if (type_k == GGML_TYPE_TURBO4_0) {
+        transcode_k_turbo4_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const char *)src_row, (char *)dst_row, head_size_k, (int64_t)1,
+            groups_per_row, src_row_stride, dst_row_stride);
+    } else if (type_k == GGML_TYPE_TURBO2_0) {
+        transcode_k_turbo2_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const char *)src_row, (char *)dst_row, head_size_k, (int64_t)1,
+            groups_per_row, src_row_stride, dst_row_stride);
     }
 }
 
 __global__ void transcode_v_turbo2_to_q8_0_kernel(
-    const block_turbo2_0 * __restrict__ src,
-    block_q8_0 *           __restrict__ dst,
+    const char *           __restrict__ src,
+    char *                 __restrict__ dst,
     const int64_t          head_size_v,
-    const int64_t          kv_size)
+    const int64_t          n_kv_rows,
+    const int64_t          groups_per_row,
+    const int64_t          src_row_stride,
+    const int64_t          dst_row_stride)
 {
     const int64_t ib = blockIdx.x;
     const int tid = threadIdx.x;
 
-    if (ib >= kv_size * (head_size_v / 128)) return;
+    if (ib >= n_kv_rows * groups_per_row) return;
 
-    const float norm = __half2float(src[ib].norm);
-    float val = turbo2_dequant_element(&src[ib], tid, norm);
+    const int64_t row = ib / groups_per_row;
+    const int64_t grp = ib % groups_per_row;
+
+    // turbo2: each 128-element rotation group is one block_turbo2_0
+    const block_turbo2_0 * src_block = (const block_turbo2_0 *)(
+        src + row * src_row_stride + grp * sizeof(block_turbo2_0));
+
+    __shared__ float x[128];
+    const float norm = __half2float(src_block->norm);
+    x[tid] = turbo2_dequant_element(src_block, tid, norm);
+    turbo_wht_inverse_128_shared(x, tid);
+    float val = x[tid];
 
     const int sub_group = tid / 32;
     const int lane_id = tid % 32;
@@ -546,29 +628,45 @@ __global__ void transcode_v_turbo2_to_q8_0_kernel(
     }
     __syncthreads();
 
-    const int64_t dst_ib = ib * 4 + sub_group;
+    // dst: 每 128 元素 → 4 个 block_q8_0 (每个 32 元素)
+    // dst_row_stride 是一行 head_size_v 个 q8_0 元素的字节数
+    // 每个 group 占 4 * sizeof(block_q8_0)
+    const int64_t dst_group_offset = grp * 4 * sizeof(block_q8_0);
+    block_q8_0 * dst_block = (block_q8_0 *)(dst + row * dst_row_stride + dst_group_offset);
+
     float scale = shared_scales[sub_group];
     if (lane_id == 0) {
-        dst[dst_ib].d = __float2half(scale);
+        dst_block[sub_group].d = __float2half(scale);
     }
 
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst[dst_ib].qs[lane_id] = (int8_t)__float2int_rn(val * inv_scale);
+    dst_block[sub_group].qs[lane_id] = (int8_t)__float2int_rn(val * inv_scale);
 }
 
 __global__ void transcode_v_turbo4_to_q8_0_kernel(
-    const block_turbo4_0 * __restrict__ src,
-    block_q8_0 *           __restrict__ dst,
+    const char *           __restrict__ src,
+    char *                 __restrict__ dst,
     const int64_t          head_size_v,
-    const int64_t          kv_size) 
+    const int64_t          n_kv_rows,
+    const int64_t          groups_per_row,
+    const int64_t          src_row_stride,
+    const int64_t          dst_row_stride)
 {
     const int64_t ib = blockIdx.x;
     const int tid = threadIdx.x;
 
-    if (ib >= kv_size * (head_size_v / 128)) return;
+    if (ib >= n_kv_rows * groups_per_row) return;
 
-    const float norm = __half2float(src[ib].norm);
-    float val = turbo4_dequant_element(&src[ib], tid, norm);
+    const int64_t row = ib / groups_per_row;
+    const int64_t grp = ib % groups_per_row;
+
+    const block_turbo4_0 * src_block = (const block_turbo4_0 *)(src + row * src_row_stride + grp * sizeof(block_turbo4_0));
+    const float norm = __half2float(src_block->norm);
+
+    __shared__ float x[128];
+    x[tid] = turbo4_dequant_element(src_block, tid, norm);
+    turbo_wht_inverse_128_shared(x, tid);
+    float val = x[tid];
 
     const int sub_group = tid / 32;
     const int lane_id = tid % 32;
@@ -585,34 +683,60 @@ __global__ void transcode_v_turbo4_to_q8_0_kernel(
     }
     __syncthreads();
 
-    const int64_t dst_ib = ib * 4 + sub_group;
+    const int64_t dst_group_offset = grp * 4 * sizeof(block_q8_0);
+    block_q8_0 * dst_block = (block_q8_0 *)(dst + row * dst_row_stride + dst_group_offset);
+
     float scale = shared_scales[sub_group];
     if (lane_id == 0) {
-        dst[dst_ib].d = __float2half(scale);
+        dst_block[sub_group].d = __float2half(scale);
     }
-    
+
     float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
-    dst[dst_ib].qs[lane_id] = (int8_t)__float2int_rn(val * inv_scale);
+    dst_block[sub_group].qs[lane_id] = (int8_t)__float2int_rn(val * inv_scale);
 }
 
 extern "C" void ggml_cuda_transcode_v(
     const void * src, void * dst,
-    int64_t head_size_v, int64_t kv_size, int type_v, void * stream)
+    int64_t head_size_v, int64_t n_kv_rows,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_v, void * stream)
 {
     cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+    int64_t groups_per_row = head_size_v / 128;
+    int64_t num_blocks = n_kv_rows * groups_per_row;
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(num_blocks, 1, 1);
 
     if (type_v == GGML_TYPE_TURBO2_0) {
-        int64_t num_blocks = kv_size * (head_size_v / 128);
-        dim3 block_size(128, 1, 1);
-        dim3 grid_size(num_blocks, 1, 1);
-        transcode_k_turbo2_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-            (const block_turbo2_0 *)src, (half *)dst, head_size_v, kv_size);
+        transcode_v_turbo2_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const char *)src, (char *)dst, head_size_v, n_kv_rows,
+            groups_per_row, src_row_stride, dst_row_stride);
     } else if (type_v == GGML_TYPE_TURBO4_0) {
-        int64_t num_blocks = kv_size * (head_size_v / 128);
-        dim3 block_size(128, 1, 1);
-        dim3 grid_size(num_blocks, 1, 1);
-        transcode_k_turbo4_to_f16_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
-            (const block_turbo4_0 *)src, (half *)dst, head_size_v, kv_size);
+        transcode_v_turbo4_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const char *)src, (char *)dst, head_size_v, n_kv_rows,
+            groups_per_row, src_row_stride, dst_row_stride);
+    }
+}
+
+extern "C" void ggml_cuda_transcode_v_row(
+    const void * src_row, void * dst_row,
+    int64_t head_size_v,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_v, void * stream)
+{
+    cudaStream_t cuda_stream = stream ? (cudaStream_t)stream : cudaStreamDefault;
+    int64_t groups_per_row = head_size_v / 128;
+    dim3 block_size(128, 1, 1);
+    dim3 grid_size(groups_per_row, 1, 1);
+
+    if (type_v == GGML_TYPE_TURBO2_0) {
+        transcode_v_turbo2_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const char *)src_row, (char *)dst_row, head_size_v, (int64_t)1,
+            groups_per_row, src_row_stride, dst_row_stride);
+    } else if (type_v == GGML_TYPE_TURBO4_0) {
+        transcode_v_turbo4_to_q8_0_kernel<<<grid_size, block_size, 0, cuda_stream>>>(
+            (const char *)src_row, (char *)dst_row, head_size_v, (int64_t)1,
+            groups_per_row, src_row_stride, dst_row_stride);
     }
 }
 
