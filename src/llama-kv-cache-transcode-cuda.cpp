@@ -29,6 +29,18 @@ extern "C" void ggml_cuda_transcode_v_row(
     int64_t src_row_stride, int64_t dst_row_stride,
     int type_v, void * stream);
 
+extern "C" void ggml_cuda_transcode_k(
+    const void * src, void * dst,
+    int64_t head_size_k, int64_t n_kv_rows,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_k, void * stream);
+
+extern "C" void ggml_cuda_transcode_v(
+    const void * src, void * dst,
+    int64_t head_size_v, int64_t n_kv_rows,
+    int64_t src_row_stride, int64_t dst_row_stride,
+    int type_v, void * stream);
+
 extern "C" void ggml_cuda_device_to_device_copy_async(void * dst, const void * src, size_t size, void * stream);
 #endif
 
@@ -37,7 +49,7 @@ bool llama_kv_cache::transcode_to_tg_cuda_k(const char * k_src_base, char * k_ds
     const int64_t n_kv = get_transcode_n_kv();
 
     // Mirror layout: no overlap between PP and TG regions.
-    // All layers launched concurrently on the same stream, no per-cell sync.
+    // Use the optimized full-layer ggml_cuda_transcode_k API for concurrent launch.
     for (size_t i = 0; i < layers.size(); ++i) {
         if (!layers[i].k) continue;
         if (!(layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) continue;
@@ -54,20 +66,16 @@ bool llama_kv_cache::transcode_to_tg_cuda_k(const char * k_src_base, char * k_ds
             int64_t dst_row_stride    = ggml_row_size(dkvt_tg_type_k(layers[i].orig_type_k), layers[i].k->ne[0]);
             int64_t dst_stream_stride = n_ctx_seq * dst_row_stride;
 
-            // No overlap in mirror layout: read directly from src, write to dst.
-            // Launch all cells async, no per-cell sync.
             for (int64_t s = 0; s < n_stream; ++s) {
                 const char * src_stream = src + s * src_stream_stride;
                 char * dst_stream = dst + s * dst_stream_stride;
 
-                for (int64_t cell = 0; cell < n_kv; ++cell) {
-                    ggml_cuda_transcode_k_row(
-                        (char*)(src_stream + cell * src_row_stride),
-                        dst_stream + cell * dst_row_stride,
-                        layers[i].k->ne[0],
-                        src_row_stride, dst_row_stride,
-                        (int) layers[i].orig_type_k, stream);
-                }
+                ggml_cuda_transcode_k(
+                    src_stream, dst_stream,
+                    layers[i].k->ne[0],
+                    n_kv,
+                    src_row_stride, dst_row_stride,
+                    (int) layers[i].orig_type_k, stream);
             }
         } else {
             // Same type: direct bulk D2D copy
@@ -109,19 +117,16 @@ bool llama_kv_cache::transcode_to_tg_cuda_v(const char * v_src_base, char * v_ds
         int64_t dst_stream_stride = n_ctx_seq * dst_row_stride;
 
         if (is_transcodable_type(layers[i].orig_type_v)) {
-            // No overlap: read directly from src, write to dst. All async.
             for (int64_t s = 0; s < n_stream; ++s) {
                 const char * src_stream = src + s * src_stream_stride;
                 char * dst_stream = dst + s * dst_stream_stride;
 
-                for (int64_t cell = 0; cell < n_kv; ++cell) {
-                    ggml_cuda_transcode_v_row(
-                        (char*)(src_stream + cell * src_row_stride),
-                        dst_stream + cell * dst_row_stride,
-                        head_size_v,
-                        src_row_stride, dst_row_stride,
-                        (int) layers[i].orig_type_v, stream);
-                }
+                ggml_cuda_transcode_v(
+                    src_stream, dst_stream,
+                    head_size_v,
+                    n_kv,
+                    src_row_stride, dst_row_stride,
+                    (int) layers[i].orig_type_v, stream);
             }
         } else {
             for (int64_t s = 0; s < n_stream; ++s) {
