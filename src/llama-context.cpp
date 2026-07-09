@@ -1393,16 +1393,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        // 动态 KV 转码 (DKVT) 延迟初始化：图分配前，一键替换与重映射
-        if (memory) {
-            memory->init_dkvt(cparams.n_ubatch, sched.get());
-        }
-
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    // 动态 KV 转码 (DKVT) 延迟初始化与伴生同步：每次执行图前，确保类型、步长和 compute cap 正确。
+    if (memory) {
+        memory->init_dkvt(cparams.n_ubatch, sched.get());
     }
 
     // set the input data for the input tensors
