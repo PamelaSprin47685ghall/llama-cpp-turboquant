@@ -119,6 +119,7 @@ struct ggml_dyn_tallocr {
     size_t alignment;
     size_t max_chunk_size;
     size_t cap; // 0 = unlimited; >0: hard ceiling on alloc offsets within chunk 0
+    size_t base_offset; // >0: first allocation starts at this offset (for mirror layouts)
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
 
@@ -161,7 +162,7 @@ static int ggml_dyn_tallocr_new_chunk(struct ggml_dyn_tallocr * alloc, size_t mi
     }
     struct tallocr_chunk * chunk = calloc(1, sizeof(struct tallocr_chunk));
     chunk->n_free_blocks = 1;
-    chunk->free_blocks[0].offset = 0;
+    chunk->free_blocks[0].offset = (alloc->n_chunks == 0) ? alloc->base_offset : 0;
     // available space in a chunk is limited to max_chunk_size, but can be higher if:
     // 1. a single tensor exceeds the maximum, and cannot fit any other way
     // 2. we are running out of chunks
@@ -375,6 +376,7 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
         /*.alignment      = */ alignment,
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
         /*.cap            = */ 0, // 0 = unlimited
+        /*.base_offset     = */ 0,
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
 #ifdef GGML_ALLOCATOR_DEBUG
@@ -389,6 +391,10 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
 
 static void ggml_dyn_tallocr_set_cap(struct ggml_dyn_tallocr * alloc, size_t cap) {
     alloc->cap = cap;
+}
+
+static void ggml_dyn_tallocr_set_base_offset(struct ggml_dyn_tallocr * alloc, size_t offset) {
+    alloc->base_offset = offset;
 }
 
 static void ggml_dyn_tallocr_free(struct ggml_dyn_tallocr * alloc) {
@@ -1344,4 +1350,9 @@ void ggml_gallocr_set_borrowed_compute_cap(ggml_gallocr_t galloc, int buffer_id,
     // propagate cap to the underlying dyn_tallocr so that
     // ggml_dyn_tallocr_alloc enforces the ceiling on every allocation
     ggml_dyn_tallocr_set_cap(galloc->buf_tallocs[buffer_id], cap);
+}
+
+void ggml_gallocr_set_borrowed_compute_base_offset(ggml_gallocr_t galloc, int buffer_id, size_t base_offset) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    ggml_dyn_tallocr_set_base_offset(galloc->buf_tallocs[buffer_id], base_offset);
 }

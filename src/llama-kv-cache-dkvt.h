@@ -121,14 +121,23 @@ static inline bool dkvt_should_reset_before_graph(
     return !dkvt_should_transcode_before_graph(n_tokens, n_outputs, kv_has_data);
 }
 
-// Return the correct compute activation buffer size for the current phase.
-// PP phase (is_transcoded_tg=false): large buffer for n_ubatch tokens.
-// TG phase (is_transcoded_tg=true): small buffer for single-token decode.
-// This value is the hard cap on compute buffer offsets within the union block,
-// preventing the graph allocator from overwriting KV cache data.
+// Return the correct compute cap for the current phase.
+// PP: compute occupies [0, size_act_pp), KV occupies [size_act_pp, ...)
+// TG (mirror): KV occupies [0, kv_total_tg), compute occupies [kv_total_tg, kv_total_tg + size_act_tg)
+// The cap tells the graph allocator the maximum offset it may use.
+// For TG, we also need a base_offset so the allocator starts after the KV region.
 static inline size_t dkvt_union_compute_cap_bytes(
-        bool is_transcoded_tg, size_t size_act_pp, size_t size_act_tg) {
-    return is_transcoded_tg ? size_act_tg : size_act_pp;
+        bool is_transcoded_tg, size_t size_act_pp, size_t size_act_tg,
+        size_t kv_total_tg = 0) {
+    if (is_transcoded_tg) {
+        return kv_total_tg + size_act_tg;
+    }
+    return size_act_pp;
+}
+
+static inline size_t dkvt_union_compute_base_offset(
+        bool is_transcoded_tg, size_t kv_total_tg = 0) {
+    return is_transcoded_tg ? kv_total_tg : 0;
 }
 
 // Compute activation bytes for one phase (PP or TG) from model geometry.

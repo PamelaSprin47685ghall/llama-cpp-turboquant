@@ -351,6 +351,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_share_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src);
     GGML_API void                 ggml_backend_sched_set_custom_buffer(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_t buf);
     GGML_API void                 ggml_backend_sched_set_borrowed_compute_cap(ggml_backend_sched_t sched, int backend_id, size_t cap_bytes);
+GGML_API void                 ggml_backend_sched_set_borrowed_compute_base_offset(ggml_backend_sched_t sched, int backend_id, size_t base_offset_bytes);
     GGML_API void                 ggml_backend_sched_clear_buffers(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute

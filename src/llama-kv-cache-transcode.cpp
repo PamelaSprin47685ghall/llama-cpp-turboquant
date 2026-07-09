@@ -59,8 +59,13 @@ void llama_kv_cache::dkvt_apply_union_compute_cap(ggml_backend_sched_t sched) co
         size_act_tg = other->size_act_tg;
     }
     if (!sched || dkvt_sched_buffer_id < 0) return;
-    size_t cap = dkvt_union_compute_cap_bytes(is_transcoded_tg, size_act_pp, size_act_tg);
+    size_t kv_total_tg = dkvt_v_size_tg + dkvt_k_size_tg;
+    size_t cap = dkvt_union_compute_cap_bytes(is_transcoded_tg, size_act_pp, size_act_tg, kv_total_tg);
     ggml_backend_sched_set_borrowed_compute_cap(sched, dkvt_sched_buffer_id, cap);
+    // In TG mode (mirror layout), compute starts AFTER the KV region.
+    // In PP mode, compute starts at offset 0 (KV is after compute).
+    size_t base_offset = dkvt_union_compute_base_offset(is_transcoded_tg, kv_total_tg);
+    ggml_backend_sched_set_borrowed_compute_base_offset(sched, dkvt_sched_buffer_id, base_offset);
 }
 
 void llama_kv_cache::dkvt_sync_pp_compute_from_sched(ggml_backend_sched_t sched, size_t measured_bytes) {

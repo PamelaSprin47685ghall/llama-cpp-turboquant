@@ -2445,3 +2445,9 @@ void ggml_backend_sched_set_borrowed_compute_cap(ggml_backend_sched_t sched, int
     GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
     ggml_gallocr_set_borrowed_compute_cap(sched->galloc, backend_id, cap_bytes);
 }
+
+void ggml_backend_sched_set_borrowed_compute_base_offset(ggml_backend_sched_t sched, int backend_id, size_t base_offset_bytes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
+    ggml_gallocr_set_borrowed_compute_base_offset(sched->galloc, backend_id, base_offset_bytes);
+}

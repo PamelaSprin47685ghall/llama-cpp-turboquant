@@ -1,108 +1,87 @@
 Here's a thinking process:
 
 1.  **Understand User Request:**
-   - **Topic:** Speculative Decoding (投机解码) for Large Language Models (LLMs)
-   - **Requirements:** Detailed analysis of pros and cons (利弊), and in-depth design recommendations (深入的设计建议)
-   - **Role:** Professional System Architect
+    - **Input:** A detailed PRD (Product Requirements Document) for "万象阵" (WanXiangZhen), a multi-agent opencode coordinator plugin.
+    - **Task:** Analyze the pros and cons of "speculative decoding" (大模型投机解码) in the context of this system, and provide in-depth design recommendations.
+    - **Context:** The PRD describes a system where a coordinator LLM decomposes tasks into a DAG, spawns isolated slave opencode processes (each with their own LLM), manages git worktrees, handles ff-only merges, and coordinates via HTTP. The system relies heavily on LLM calls for task decomposition, slave work execution, review loops, and progress reporting.
 
-2.  **Deconstruct the Topic (Speculative Decoding):**
-   - *What is it?* A technique to accelerate LLM inference by using a small, fast "draft" model to propose multiple candidate tokens, which are then verified in parallel by the large "target" model in a single forward pass. If the draft matches the target's distribution, multiple tokens are accepted; otherwise, the target's output is used and the process repeats.
-   - *Key Components:* Draft Model, Target Model, Verification Step, Acceptance Criterion.
-   - *Core Mechanism:* Parallel verification of draft tokens via KV-cache reuse and batched forward pass on the target model.
+2.  **Deconstruct "Speculative Decoding" (投机解码) in this Context:**
+    - *What is speculative decoding?* In LLM inference, it's a technique where a small "draft" model generates multiple tokens quickly, and a large "target" model verifies them in parallel. If verified, they're accepted; otherwise, the sequence is truncated and the target model generates from the last accepted token.
+    - *How does it apply to this system?* The system involves multiple LLM calls:
+        - Coordinator LLM: Task decomposition (`squad_update`), progress reporting, nudge prompts.
+        - Slave LLMs: Code development, `/loop` review, rebase handling, tool calling (`submit_to_squad`, `query_squad`).
+    - Speculative decoding could be applied at the *inference layer* (speeding up individual LLM calls) or at the *system/agent layer* (speculative task execution, speculative tool calling, speculative DAG planning).
+    - I need to analyze both angles but focus on what's most relevant to the PRD's architecture.
 
-3.  **Analyze Pros (利):**
-   - **Speedup/Acceleration:** Significant reduction in latency, especially for autoregressive generation where the bottleneck is sequential decoding. Can achieve 2x-5x speedup (or more) depending on acceptance rate.
-   - **Quality Preservation:** The target model's output distribution is mathematically preserved (exact sampling or bounded divergence). No degradation in output quality.
-   - **Hardware Efficiency:** Better GPU utilization through parallel verification. Reduces memory bandwidth pressure per token.
-   - **Flexibility:** Works with various draft models (smaller LLMs, n-gram, greedy, etc.). Can be integrated into existing inference frameworks.
-   - **KV-Cache Reuse:** Efficient memory usage by reusing the target model's KV-cache for verification.
+3.  **Analyze Pros & Cons (Brainstorming & Structuring):**
 
-4.  **Analyze Cons (弊):**
-   - **Acceptance Rate Dependency:** Performance heavily relies on the draft model's accuracy. Poor draft models lead to low acceptance rates, causing overhead without speedup.
-   - **Draft Model Overhead:** Training/fine-tuning a good draft model adds complexity. Inference overhead for the draft model itself.
-   - **Memory/Compute Imbalance:** Verification step requires a forward pass on the target model for `n` tokens. If `n` is too large, it might exceed batch size limits or cause memory spikes.
-   - **Scheduling Complexity:** Dynamic batch sizes, variable acceptance lengths, and mixed precision complicate inference engine design.
-   - **Not Always Beneficial:** For very short sequences, high-temperature sampling, or when the target model is already fast (e.g., quantized), the overhead may outweigh benefits.
-   - **Distribution Mismatch:** If draft and target distributions differ significantly, rejection sampling overhead increases.
+    *Pros (利):*
+    - **Speed/Throughput:** Reduces latency for coordinator slave LLM calls. Faster task decomposition → faster scheduler ticks → faster overall project completion.
+    - **Cost Efficiency:** Draft model is cheaper. Can handle routine slave tasks (simple code edits, standard rebase prompts) with a smaller model.
+    - **Parallelism Alignment:** Matches the system's parallel slave architecture. Multiple slaves can run concurrently; faster per-task inference means higher effective concurrency.
+    - **Speculative DAG Planning:** Coordinator could draft multiple DAG branches/speculations before committing to one, reducing back-and-forth with the user/LLM.
+    - **Tool Call Optimization:** Speculative tool calling (drafting `submit_to_squad` or `/loop` calls before final verification) could streamline slave workflows.
 
-5.  **Design Recommendations (深入的设计建议):**
-   - *Architecture Level:*
-     - Hybrid Draft Strategies: Combine multiple draft methods (e.g., small model + n-gram + greedy) with dynamic switching.
-     - Adaptive Acceptance Length: Dynamically adjust `n` based on context, acceptance rate history, or sequence stage.
-     - Pipeline Parallelism: Overlap draft generation with target verification using multi-stream or async execution.
-   - *Model Level:*
-     - Draft Model Selection: Use distilled/quantized versions of the target model. Fine-tune on target's output distribution.
-     - Shared Architecture: If draft and target share layers (e.g., early-exit or shared backbone), reduce overhead.
-     - Confidence-Aware Drafting: Use draft model's logits/entropy to decide when to draft vs. fall back to target.
-   - *Inference Engine Level:*
-     - KV-Cache Management: Efficiently handle variable-length acceptance. Use contiguous memory allocation or segmented caches.
-     - Batch Verification Optimization: Pack verification batches dynamically. Use kernel fusion for multi-token forward pass.
-     - Quantization & Precision: Run draft in lower precision (INT8/FP8), target in higher precision. Mixed-precision verification.
-     - Scheduling & Profiling: Real-time monitoring of acceptance rate, latency, and GPU utilization. Adaptive throttling.
-   - *System Integration:*
-     - Framework Support: Integrate with vLLM, TensorRT-LLM, SGLang. Provide pluggable draft modules.
-     - Benchmarking & A/B Testing: Measure speedup, acceptance rate, quality metrics (BLEU, human eval) under diverse workloads.
-     - Fallback Mechanisms: Graceful degradation if draft fails or acceptance rate drops below threshold.
+    *Cons (弊):*
+    - **Complexity vs. Reliability:** The PRD emphasizes deterministic state machines, ff-only merges, and strict validation. Speculative decoding introduces probabilistic acceptance/rejection, which could conflict with the "deterministic state machine" principle (公理 6: 类型消灭不可能态).
+    - **State Machine Incompatibility:** `TaskStatus` transitions are strict. If a slave LLM speculatively calls `submit_to_squad` but the draft is rejected, the slave might be in an inconsistent state (e.g., thinks it submitted, but coordinator rejected). This violates the "command can be rejected, event cannot be denied" principle.
+    - **Resource Contention:** Speculative decoding requires running two models (draft + target) or batching verification. In a resource-constrained environment (multiple slaves + coordinator), this could spike memory/CPU.
+    - **Error Propagation:** If speculative tool calls (like `submit_to_squad`) are drafted and rejected, the slave might need to roll back state, complicating the clean `do-while ff` loop.
+    - **Debuggability:** The PRD values traceability (NDJSON SSOT, git as second truth source). Speculative steps that don't commit to the event log create "ghost" states that are hard to reconcile during replay.
+    - **Security/Safety:** Speculative tool calls could trigger side effects (e.g., `submit_to_squad` with wrong `commitSha`) if not carefully gated. The PRD's strict HTTP API with bearer tokens and serial queues assumes deterministic, verified calls.
 
-6.  **Structure the Response:**
-   - Introduction: Briefly define speculative decoding and its core mechanism.
-   - 利 (Pros): Detailed, categorized analysis.
-   - 弊 (Cons): Detailed, categorized analysis.
-   - 深入设计建议 (In-depth Design Recommendations): Structured by architecture, model, engine, system levels.
-   - Conclusion: Summary and future outlook.
-   - *Tone:* Professional, technical, architect-level, practical.
-   - *Language:* Chinese (as requested).
+4.  **Synthesize & Structure the Analysis:**
+    I'll structure the response logically:
+    - Introduction: Define speculative decoding in this context.
+    - Pros (利): Group into inference speed, system throughput, cost, and architectural alignment.
+    - Cons (弊): Group into state machine conflicts, reliability/debuggability, resource overhead, and security/safety.
+    - Design Recommendations: Provide actionable, PRD-aligned strategies for implementing speculative decoding safely.
+    - Conclusion: Summary of when/where to apply it.
 
-   Draft Structure (Mental):
-   ```
-   一、投机解码核心机制简述
-   二、核心优势（利）
-     1. 推理加速显著
-     2. 输出质量无损
-     3. 硬件利用率提升
-     4. 架构灵活兼容
-   三、核心劣势（弊）
-     1. 接受率依赖性强
-     2. 草稿模型开销与训练成本
-     3. 验证阶段计算/内存波动
-     4. 调度与工程复杂度
-     5. 特定场景收益递减
-   四、深入设计建议
-     1. 架构层：混合草稿策略与自适应接受长度
-     2. 模型层：草稿模型选型与分布对齐
-     3. 推理引擎层：KV缓存优化与批验证调度
-     4. 系统层：可观测性与弹性降级
-   五、总结与演进方向
-   ```
+    *Key PRD Principles to Reference:*
+    - 公理 2: 事件流是事实，内存DAG是投影 (SSOT = NDJSON)
+    - 公理 6: 类型消灭不可能态 (strict state machine)
+    - 决策 2.4: 命令可拒，事件不可驳
+    - 决策 1.4: slave发起短连接，coordinator不主动
+    - 串行队列 (SerialQueue) 原子性
+    - 形式主义完成 (done不管内容)
 
-7.  **Flesh out Content (Mental Refinement - Chinese):**
-   *(I'll write this out carefully, ensuring technical accuracy and depth.)*
+5.  **Draft - Section by Section (Mental Refinement):**
 
-   **一、核心机制简述**
-   投机解码（Speculative Decoding）通过“小模型草稿+大模型并行验证”打破自回归生成的串行瓶颈。草稿模型快速生成 `n` 个候选 token，目标模型在一次前向传播中并行验证。若匹配则全部接受，否则回退至目标模型输出并重新生成。核心依赖接受率（Acceptance Rate）和 KV-Cache 复用。
+    *(Introduction)*
+    大模型投机解码（Speculative Decoding）在本系统中可指两层含义：
+    1. **推理层**：用轻量draft模型快速生成token，大模型并行验证，加速单次LLM调用。
+    2. **Agent/系统层**：在工具调用、DAG规划、任务执行前进行“草稿-验证”循环，提前探索分支。
+    需结合PRD的强类型状态机、NDJSON SSOT、ff-only合并等核心约束分析。
 
-   **二、利**
-   - *推理加速显著*：将 `n` 个 token 的串行解码压缩为 1 次大模型前向+1 次草稿生成。理论加速比 ≈ `n * acceptance_rate`。实测 2x~5x 提升。
-   - *输出质量无损*：基于拒绝采样（Rejection Sampling）保证目标分布严格一致（或可控偏差），不引入生成质量下降。
-   - *硬件利用率提升*：验证阶段大模型单次前向处理 `n` 个 token，显存带宽利用率提升；减少逐 token 的 kernel launch 开销。
-   - *架构灵活兼容*：草稿模型可为任意架构（小LLM、n-gram、规则引擎）；可与现有推理框架（vLLM/TensorRT-LLM）插件化集成。
+    *(Pros)*
+    - **推理加速与吞吐提升**：Slave LLM执行代码开发、`/loop` review、rebase处理时，投机解码可显著降低单次调用延迟。多slave并行时，整体项目交付周期缩短。
+    - **成本优化**：简单任务（如标准rebase提示、固定格式`submit_to_squad`）可用小模型draft，大模型仅验证关键决策，降低API成本。
+    - **与并行架构天然契合**：系统依赖多slave并发，推理加速直接提升有效并发数，缓解`maxConcurrent`瓶颈。
+    - **DAG规划投机**：Coordinator可预生成多个依赖分支草案，经拓扑校验后择优提交，减少LLM与用户的来回交互。
 
-   **三、弊**
-   - *接受率依赖性强*：加速比直接绑定草稿质量。接受率 < 50% 时可能反降速。长尾/专业领域分布偏移时接受率骤降。
-   - *草稿模型开销*：需额外训练/蒸馏，增加研发成本。推理阶段草稿模型本身占用计算/显存，低接受率时成为纯开销。
-   - *验证阶段波动*：`n` 个 token 的并行验证计算量固定，但实际接受长度随机。导致 GPU 利用率波动、显存碎片化。
-   - *调度复杂度*：动态 batch size、变长接受序列、多流并发增加推理引擎调度难度。需处理 KV-Cache 的连续/非连续分配。
-   - *特定场景收益递减*：短序列、高温度采样、已量化模型、或目标模型本身极快时，草稿开销可能超过收益。
+    *(Cons)*
+    - **与强类型状态机冲突**：PRD强调`TaskStatus`有限状态机+穷举转移。投机解码的“草稿-拒绝-回滚”会引入中间态（如slave认为已submit但实际未提交），破坏状态机确定性。
+    - **与SSOT/事件溯源矛盾**：NDJSON是SSOT，投机步骤若不落盘，重放时无法还原；若落盘，则产生“幽灵事件”，违反“事件不可驳”原则。
+    - **串行队列原子性受损**：`submit_to_squad`经SerialQueue原子执行。投机调用可能触发未验证的ff检查，破坏“检查+合并”的原子不变式。
+    - **资源与调试开销**：双模型推理增加内存/CPU压力；投机产生的未提交状态难以在NDJSON重放中追踪，增加调试成本。
+    - **安全边界模糊**：投机工具调用可能绕过bearer token校验或触发未授权ff，与PRD“命令可拒”原则冲突。
 
-   **四、深入设计建议**
-   *(Structure by layers for architectural depth)*
-   - **架构层**
-     - 混合草稿策略：动态组合小模型+历史 n-gram+贪婪解码。根据上下文置信度切换。
-     - 自适应接受长度 `n`：基于滑动窗口接受率、序列阶段（开头/中间/结尾）、温度参数动态调整。避免固定 `n` 的僵化。
-     - 流水线重叠：草稿生成与目标验证异步执行（多 CUDA Stream），隐藏草稿延迟。
-   - **模型层**
-     - 草稿模型选型：优先使用目标模型的蒸馏/量化版本。共享底层 Transformer 层可进一步降低开销。
-     - 分布对齐训练：在目标模型输出分布上微调草稿模型（Logit Matching / Soft Label Distillation）。
-     - 置信度门控：草稿模型输出熵/最大概率 > 阈值时直接接受，否则触发验证。减少无效验证。
-   - **推理引擎层**
-     - KV-Cache 优化：采用分段连续分配（Segmented Contiguous Allocation）或动态扩容
+    *(Design Recommendations)*
+    Need to be highly specific and aligned with the PRD. I'll propose a layered approach:
+    1. **严格分层：推理层投机 vs. 系统层投机**
+       - 推理层：安全，可应用于slave LLM的常规代码生成、review提示。需确保验证失败时不触发副作用。
+       - 系统层：谨慎，仅限DAG规划、prompt构造。禁止对`submit_to_squad`、`squad_update`等关键工具调用进行投机。
+    2. **状态机兼容设计**
+       - 投机步骤必须标记为`draft`，不改变`TaskStatus`，不写入NDJSON。
+       - 验证通过后，再显式触发状态转移（如`pending→running`），确保状态机穷举匹配。
+    3. **事件溯源对齐**
+       - 投机过程不产生事件。仅最终确认的动作写入NDJSON。
+       - 若需记录投机历史，使用独立`event_log`（非SSOT），与主事件流解耦。
+    4. **串行队列保护**
+       - 关键路径（ff检查、worktree创建、状态转移）禁止投机。仅允许在“纯计算/纯生成”阶段（如prompt构造、代码草稿）使用。
+    5. **降级与回滚机制**
+       - 投机失败时，slave自动回滚到上一确定状态，不依赖coordinator干预。
+       - 提供`speculative_timeout`配置，超时后降级为确定性执行。
+    6. **安全与审计**
+       - 投机工具调用必须经过`Authorization`校验，且响应走标准

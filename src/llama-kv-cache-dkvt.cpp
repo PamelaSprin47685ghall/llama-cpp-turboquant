@@ -17,7 +17,20 @@ extern "C" bool ggml_cuda_get_mem_info(size_t * free, size_t * total);
 void llama_kv_cache::dkvt_bind_common(size_t size_act, size_t dkvt_v_size, bool use_tg_type) {
     if (!vram_union_block || !ptr_start) return;
 
-    char * kv_base = ptr_start + size_act;
+    // Mirror layout:
+    // PP: [compute(0..size_act_pp) | V_pp | K_pp]  — compute at LOW, KV at HIGH
+    // TG: [V_tg | K_tg | compute(0..size_act_tg)]  — KV at LOW, compute at HIGH
+    //
+    // This guarantees PP KV and TG KV NEVER overlap in the union buffer,
+    // making in-place transcode safe without any extra scratch memory.
+    char * kv_base;
+    if (use_tg_type) {
+        // TG: KV at offset 0, compute after KV
+        kv_base = ptr_start;
+    } else {
+        // PP: compute first, KV after compute (original layout)
+        kv_base = ptr_start + size_act;
+    }
 
     for (size_t i = 0; i < layers.size(); ++i) {
         ggml_type target_type_k = use_tg_type ? dkvt_tg_type_k(layers[i].orig_type_k) : layers[i].orig_type_k;
@@ -178,7 +191,7 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
         disable_dkvt_ext_flags();
         return;
     }
-    LLAMA_LOG_INFO("llama_kv_cache: init_dkvt: other=%p, layers=%zu, n_seq_max=%u\n", (void*)other, layers.size(), n_seq_max);
+    LLAMA_LOG_WARN("llama_kv_cache: init_dkvt: other=%p, layers=%zu, n_seq_max=%u, is_transcoded_tg=%d\n", (void*)other, layers.size(), n_seq_max, (int)is_transcoded_tg);
     dkvt_sched = sched;
     if (other) {
         init_dkvt_borrow();

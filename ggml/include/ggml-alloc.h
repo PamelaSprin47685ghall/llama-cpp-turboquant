@@ -87,6 +87,7 @@ GGML_API bool             ggml_gallocr_is_borrowed(ggml_gallocr_t galloc, int bu
 // compute graph from growing into the KV region of a union buffer.
 // Pass 0 to disable the cap. Must be called before ggml_gallocr_reserve.
 GGML_API void             ggml_gallocr_set_borrowed_compute_cap(ggml_gallocr_t galloc, int buffer_id, size_t compute_cap_bytes);
+GGML_API void             ggml_gallocr_set_borrowed_compute_base_offset(ggml_gallocr_t galloc, int buffer_id, size_t base_offset_bytes);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
