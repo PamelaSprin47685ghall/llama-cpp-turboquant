@@ -152,8 +152,10 @@ void llama_kv_cache::init_dkvt_borrow() {
     // 重置 is_transcoded_tg = false，若先绑定再同步则状态丢失。
     if (is_transcoded_tg) {
         dkvt_bind_tg();
+        LLAMA_LOG_WARN("llama_kv_cache: DKVT companion rebind to TG (mirror layout, KV at offset 0)\n");
     } else {
         dkvt_bind_pp();
+        LLAMA_LOG_WARN("llama_kv_cache: DKVT companion rebind to PP (compute first, KV at high offset)\n");
     }
 
     LLAMA_LOG_INFO("llama_kv_cache: DKVT draft context borrowed union buffer from parent (%p, %.2f MiB), is_transcoded_tg=%d\n",
@@ -194,6 +196,10 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
     LLAMA_LOG_WARN("llama_kv_cache: init_dkvt: other=%p, layers=%zu, n_seq_max=%u, is_transcoded_tg=%d\n", (void*)other, layers.size(), n_seq_max, (int)is_transcoded_tg);
     dkvt_sched = sched;
     if (other) {
+        // init_dkvt_borrow() syncs is_transcoded_tg from parent and
+        // rebinds shared layer pointers to match parent's current layout (PP or TG).
+        // This is called on every process_ubatch, so companion stays in sync
+        // even after parent transcodes between PP and TG phases.
         init_dkvt_borrow();
         dkvt_apply_union_compute_cap(sched);
         return;

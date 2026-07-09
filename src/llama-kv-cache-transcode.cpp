@@ -59,6 +59,15 @@ void llama_kv_cache::dkvt_apply_union_compute_cap(ggml_backend_sched_t sched) co
         size_act_tg = other->size_act_tg;
     }
     if (!sched || dkvt_sched_buffer_id < 0) return;
+    // Only set cap/base_offset on the PARENT's scheduler (not companion).
+    // The companion context has its own independent scheduler with its own buffers.
+    // Setting base_offset on the companion's scheduler would corrupt its allocations.
+    if (other) {
+        // Companion: do not set cap or base_offset on its own scheduler.
+        // The companion's shared layers point to the parent's union buffer,
+        // but the companion's compute tensors are in its own independent buffer.
+        return;
+    }
     size_t kv_total_tg = dkvt_v_size_tg + dkvt_k_size_tg;
     size_t cap = dkvt_union_compute_cap_bytes(is_transcoded_tg, size_act_pp, size_act_tg, kv_total_tg);
     ggml_backend_sched_set_borrowed_compute_cap(sched, dkvt_sched_buffer_id, cap);
