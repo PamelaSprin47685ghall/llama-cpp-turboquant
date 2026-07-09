@@ -1179,7 +1179,11 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
 
-llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
+llama_memory_recurrent_context::~llama_memory_recurrent_context() {
+    if (status == LLAMA_MEMORY_STATUS_SUCCESS && mem) {
+        std::fill(mem->rs_idx.begin(), mem->rs_idx.end(), 0);
+    }
+}
 
 bool llama_memory_recurrent_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
@@ -1254,8 +1258,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
+            // Do NOT reset here! It will be reset in the destructor after the entire graph has finished building.
         }
     }
     return (int32_t)(idx * mem->size) + src0;
