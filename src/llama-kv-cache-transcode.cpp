@@ -208,9 +208,44 @@ void llama_kv_cache::transcode_to_tg(void * stream) {
         throw std::runtime_error("DKVT transcode required but union buffer is not initialized");
     }
 
-    // 伴生上下文同步：若主上下文已转码，伴生上下文直接复用绑定
+    // 伴生上下文转码：伴生上下文有自己独立的层（如 MTP 层），
+    // 必须执行自己的转码内核，不能仅复用主上下文的绑定。
     if (other) {
         if (other->is_transcoded_tg && !is_transcoded_tg) {
+            // Check if companion has its own transcodable layers with data
+            bool has_own_transcodable = false;
+            for (size_t i = 0; i < layers.size(); ++i) {
+                // Only transcode layers that are NOT shared with parent (no matching il in parent)
+                int32_t il = layers[i].il;
+                if (other->map_layer_ids.count(il) == 0) {
+                    if ((layers[i].k && is_transcodable_type(layers[i].orig_type_k) && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) ||
+                        (layers[i].v && is_transcodable_type(layers[i].orig_type_v) && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT))) {
+                        has_own_transcodable = true;
+                        break;
+                    }
+                }
+            }
+            if (has_own_transcodable && vram_union_block && ptr_start) {
+                // Run transcode kernel on companion's own layers
+                bool is_cuda = false;
+#ifdef GGML_USE_CUDA
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(vram_union_block);
+                if (buft) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                    if (dev) {
+                        enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev);
+                        is_cuda = (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU);
+                    }
+                }
+#endif
+                if (is_cuda) {
+                    if (!transcode_to_tg_cuda(stream)) {
+                        throw std::runtime_error("DKVT companion CUDA transcode_to_tg failed");
+                    }
+                } else {
+                    transcode_to_tg_cpu();
+                }
+            }
             this->dkvt_bind_tg();
             is_transcoded_tg = true;
             return;
