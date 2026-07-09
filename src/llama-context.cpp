@@ -101,10 +101,10 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
-                throw std::runtime_error("EAGLE3 requires ctx_other to be set (this warning is normal during memory fitting)");
+                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
             }
             cparams.ctx_other = params.ctx_other;
         }
@@ -1383,7 +1383,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
-    const int64_t n_embd = hparams.n_embd_inp();
+    const int64_t n_embd = hparams.n_embd_inp_enc();
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
