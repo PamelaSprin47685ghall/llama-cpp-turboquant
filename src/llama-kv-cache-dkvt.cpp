@@ -179,6 +179,12 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
         return;
     }
     LLAMA_LOG_INFO("llama_kv_cache: init_dkvt: other=%p, layers=%zu, n_seq_max=%u\n", (void*)other, layers.size(), n_seq_max);
+    dkvt_sched = sched;
+    if (other) {
+        init_dkvt_borrow();
+        dkvt_apply_union_compute_cap(sched);
+        return;
+    }
     if (vram_union_block) {
         dkvt_apply_union_compute_cap(sched);
         return;
@@ -202,15 +208,6 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
     if (this->n_seq_max > 1) {
         throw std::runtime_error(
             "DKVT with speculative decoding requires n_parallel/n_seq_max = 1.");
-    }
-
-    // 伴生上下文直接借用主上下文的 union buffer，无需独立分配。
-    // 必须使用伴生上下文自己的调度器（由调用者传入），不能复用主上下文调度器，
-    // 否则 compute cap 会错误地设置到主调度器上，导致伴生图可能覆盖 union buffer 中的 KV 数据。
-    dkvt_sched = sched;
-    if (other) {
-        init_dkvt_borrow();
-        return;
     }
 
     ggml_backend_buffer_type_t buft = nullptr;
