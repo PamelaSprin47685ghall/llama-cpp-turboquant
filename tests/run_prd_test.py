@@ -22,7 +22,7 @@ def main():
     payload = {
         "messages": [
             {"role": "system", "content": "你是一个专业的系统架构师。"},
-            {"role": "user", "content": "请详细分析大模型投机解码的利弊，并给出深入的设计建议。"}
+            {"role": "user", "content": f"{prompt}\n\n请根据上述PRD文档，详细分析大模型投机解码的利弊，并给出深入的设计建议。"}
         ],
         "stream": True,
         "max_tokens": 2048,
