@@ -22,14 +22,20 @@ add_library(llama
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
-            llama-kv-cache.cpp
-            llama-kv-cache-dkvt.cpp
+             llama-kv-cache.cpp
+             llama-kv-cache-state.cpp
+             llama-kv-cache-dkvt.cpp
+            llama-kv-cache-dkvt-size.cpp
             llama-kv-cache-transcode.cpp
+            llama-kv-cache-transcode-cuda.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-cache-iswa-context.cpp
             llama-kv-cache-dsa.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
+            llama-memory-hybrid-context.cpp
             llama-memory-hybrid-iswa.cpp
+            llama-memory-hybrid-iswa-context.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp

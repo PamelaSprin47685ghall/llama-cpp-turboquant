@@ -38,8 +38,9 @@ public:
                      bool   offload,
                      bool   unified,
                             /* layer filters */
-    const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+     const layer_filter_cb & filter_attn = nullptr,
+     const layer_filter_cb & filter_recr = nullptr,
+                       bool   disable_dkvt = false);
 
     ~llama_memory_hybrid_iswa() = default;
 
@@ -134,6 +135,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool get_dkvt_active() const override { return ctx_attn ? ctx_attn->get_dkvt_active() : false; }
 
     //
     // llama_memory_hybrid_iswa_context

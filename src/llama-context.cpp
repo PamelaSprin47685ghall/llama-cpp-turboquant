@@ -222,6 +222,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.disable_dkvt = params.disable_dkvt;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1836,17 +1837,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     };
 
-    if (memory && memory->get_dkvt_active()) {
+    if (memory && memory->get_dkvt_active() && !cparams.embeddings_nextn_masked) {
         const llama_pos seq_pos_max_0 = memory->seq_pos_max(0);
         const bool kv_has_data = (seq_pos_max_0 >= 0);
         LLAMA_LOG_WARN("%s: DKVT check: seq_pos_max(0)=%d, n_tokens=%u, n_outputs=%u, kv_has_data=%d, is_transcoded_tg=%d\n",
                        __func__, (int) seq_pos_max_0, n_tokens_all, n_outputs_all, (int) kv_has_data, (int) memory->get_is_transcoded_tg());
+        GGML_ASSERT(!cparams.embeddings_nextn_masked && "Invariance Guard: MTP draft context must never enter DKVT reset/transcode block");
         if (dkvt_should_reset_before_graph(
                 n_tokens_all, n_outputs_all,
                 memory->get_is_transcoded_tg(), kv_has_data)) {
             memory->dkvt_reset();
             if (gf_res_prev) {
                 gf_res_prev->reset();
+            }
+            if (cparams.ctx_other) {
+                llama_context * ctx_other = cparams.ctx_other;
+                if (ctx_other->gf_res_prev) {
+                    ctx_other->gf_res_prev->reset();
+                }
+                llama_memory_t mem_dft = llama_get_memory(ctx_other);
+                if (mem_dft && mem_dft->get_dkvt_active()) {
+                    mem_dft->dkvt_reset();
+                }
             }
         } else if (dkvt_should_transcode_before_graph(
                        n_tokens_all, n_outputs_all, kv_has_data)) {
@@ -2392,7 +2404,7 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
             }
@@ -3607,9 +3619,11 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.disable_dkvt                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.share_compute_buffers_with  =*/ nullptr,
     };
 
     return result;

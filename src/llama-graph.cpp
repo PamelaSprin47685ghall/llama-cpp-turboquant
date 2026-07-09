@@ -2391,7 +2391,8 @@ ggml_tensor * llm_graph_context::build_attn(
     // TurboQuant: if V was padded, the output has padded dimensions.
     // Extract original V head_dim after inverse WHT (applied inside build_attn_mha).
     // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    // DKVT: also trigger when DKVT is active — transcode changes v->type to Q8_0/F16 but layout remains padded
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || (mctx_cur && mctx_cur->get_dkvt_active())) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         // cur is 2D: (n_embd_head * n_head, n_tokens) after build_attn_mha
         const int64_t padded_v_head = (v->nb[1] > v->nb[2]) ? v->ne[2] : v->ne[0];
@@ -2727,7 +2728,8 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // TurboQuant: if V was padded, extract original V head_dim after inverse WHT
     // NOTE: gate on v->type (not k->type) for asymmetric configs where K=q8_0 but V=turbo
-    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+    // DKVT: also trigger when DKVT is active — transcode changes v->type to Q8_0/F16 but layout remains padded
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || (mctx_cur && mctx_cur->get_dkvt_active())) {
         const int64_t orig_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
         if (padded_v_head != orig_v_head) {

@@ -1066,6 +1066,9 @@ private:
             cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
             cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
+            if (params_base.speculative.draft.n_gpu_layers == 0) {
+                cparams_mtp.offload_kqv = false;
+            }
             cparams_mtp.n_rs_seq      = 0;
             cparams_mtp.n_outputs_max = std::max<int32_t>(params_base.n_parallel, 4);
             cparams_mtp.ctx_other     = ctx_tgt;

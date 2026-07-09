@@ -29,7 +29,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                         bool   is_mtp = false);
+                          bool   is_mtp = false,
+                          bool   disable_dkvt = false);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -131,6 +132,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool get_dkvt_active() const override { return ctx_base ? ctx_base->get_dkvt_active() : false; }
 
     //
     // llama_kv_cache_iswa_context specific API

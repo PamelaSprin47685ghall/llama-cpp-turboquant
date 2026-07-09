@@ -2104,7 +2104,8 @@ llama_memory_i * res;
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* disable_dkvt      */ cparams.disable_dkvt);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2123,7 +2124,8 @@ llama_memory_i * res;
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* disable_dkvt      */ cparams.disable_dkvt);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

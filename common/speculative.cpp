@@ -954,6 +954,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+
+        // Reset cross-task state: zero pending_h, clear verify_h, reset scalars, purge draft KV.
+        if (seq_id >= 0 && seq_id < (llama_seq_id) pending_h.size()) {
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        }
+        if (seq_id >= 0 && seq_id < (llama_seq_id) verify_h.size()) {
+            verify_h[seq_id].clear();
+        }
+        if (seq_id >= 0 && seq_id < (llama_seq_id) verify_h_rows.size()) {
+            verify_h_rows[seq_id] = 0;
+        }
+        if (seq_id >= 0 && seq_id < (llama_seq_id) last_n_drafted.size()) {
+            last_n_drafted[seq_id] = 0;
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, 0, -1);
+
+        // TDD RED: detect dirty state residue in pending_h from a previous task
+        {
+            const float * h = pending_h[seq_id].data();
+            const size_t n = pending_h[seq_id].size();
+            for (size_t i = 0; i < n; ++i) {
+                if (h[i] != 0.0f) {
+                    GGML_ABORT("TDD RED Failure: MTP pending_h dirty state residue detected!");
+                }
+            }
+        }
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1021,6 +1047,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
+            // Clear any draft KV cache residue before catch-up decoding to prevent duplicate cells.
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                }
+            }
+
             const int32_t rc = llama_decode(ctx_dft, batch);
             if (rc != 0) {
                 LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
@@ -1072,6 +1105,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dp.n_past, -1);
+                const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+                if (pos_max >= dp.n_past) {
+                    fprintf(stderr, "[TDD RED] KV residue detected: seq_id=%d, pos_max=%d, dp.n_past=%d\n",
+                            (int) seq_id, (int) pos_max, (int) dp.n_past);
+                    GGML_ABORT("TDD Failure: Residue KV cache detected at draft start!");
+                }
+            }
+
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
 
             h_row = pending_h[seq_id].data();
@@ -1120,6 +1163,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                     continue;
                 }
+
+                // print drafted token
+                fprintf(stderr, "[MTP Draft] seq %d, pos %d: '%s' (prob %.4f)\n",
+                        (int)seq_id, (int)(dparams[seq_id].n_past + i),
+                        common_token_to_piece(ctx_dft, id).c_str(),
+                        cur_p->data[0].p);
 
                 common_sampler_accept(smpl, id, true);
 

@@ -2360,7 +2360,6 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
             sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
             sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_2, p16_3));
-
         }
 
         sumi = _mm256_sub_epi32(sumi, q8sclsub);

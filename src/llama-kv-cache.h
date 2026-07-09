@@ -113,7 +113,8 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                         bool   is_mtp = false);
+                          bool   is_mtp = false,
+                          bool   disable_dkvt = false);
 
     void init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) override;
     void disable_dkvt_ext_flags() override;
@@ -320,9 +321,10 @@ private:
 
     bool is_transcoded_tg = false;
     bool is_mtp = false;
+    bool disable_dkvt = false;
 
-    size_t size_act_pp = 0;
-    size_t size_act_tg = 0;
+    mutable size_t size_act_pp = 0;
+    mutable size_t size_act_tg = 0;
 
     // 动态 KV 转码 (DKVT) 终极双向对撞式成员
     ggml_backend_buffer_t vram_union_block = nullptr;
@@ -396,8 +398,10 @@ private:
     bool transcode_to_tg_cuda_v(const char * v_src_base, char * v_dst_base, void * stream);
     void transcode_to_tg_cpu();
     void dkvt_bind_tg();
+    void dkvt_bind_common(size_t size_act, size_t dkvt_v_size, bool use_tg_type);
 
     friend int test_companion_offset_sync();
+    friend int test_transcoded_layout_strides();
     friend int test_mtp_child_inherits_parent_kv();
     friend int test_dkvt_clear_resets_layout();
     friend int test_dkvt_companion_layout_sync_after_parent_reset();
@@ -475,6 +479,8 @@ public:
     ggml_tensor * get_turbo_rot_inverse() const override;
 
     const llama_kv_cache_context * as_kv_cache_context() const override { return this; }
+
+    bool get_dkvt_active() const override { return kv ? kv->get_dkvt_active() : false; }
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization
     ggml_tensor * get_turbo_innerq_scale_inv() const override;

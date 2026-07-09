@@ -80,6 +80,9 @@ struct llama_memory_context_i {
     // Polymorphic accessor for KV cache context without dynamic_cast.
     // Returns the llama_kv_cache_context if this object is/has one, else nullptr.
     virtual const llama_kv_cache_context * as_kv_cache_context() const { return nullptr; }
+
+    // DKVT: indicate whether this memory context owns or borrows an active union block with padded layout
+    virtual bool get_dkvt_active() const { return false; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

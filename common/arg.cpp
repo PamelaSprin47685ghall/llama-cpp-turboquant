@@ -1287,6 +1287,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        {"--disable-dkvt"},
+        "disable DKVT dynamic KV transcode completely",
+        [](common_params & params) {
+            params.disable_dkvt = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

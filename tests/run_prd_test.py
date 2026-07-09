@@ -21,12 +21,12 @@ def main():
     url = "http://127.0.0.1:8080/v1/chat/completions"
     payload = {
         "messages": [
-            {"role": "system", "content": "你是一个专业的系统架构师。请阅读下面的万象阵 PRD 文档。"},
-            {"role": "user", "content": f"以下是项目文档：\n\n{prompt}\n\n请详细分析这份万象阵 PRD 的利弊，并给出深入的设计建议。"}
+            {"role": "system", "content": "你是一个专业的系统架构师。"},
+            {"role": "user", "content": "请详细分析大模型投机解码的利弊，并给出深入的设计建议。"}
         ],
         "stream": True,
         "max_tokens": 2048,
-        "temperature": 0.7,
+        "temperature": 0.0,
         "stream_options": {"include_usage": True}
     }
     
@@ -100,6 +100,15 @@ def main():
     print(f"  - Total Time: {total_duration:.3f} s")
     print(f"  - Final output length (chars): {len(full_text)}")
     print(f"  - Coherence Check: Output contains {full_text.count('think')} thinking tags, first 200 chars: {repr(full_text[:200])}")
+
+    # Write output to test output file for evaluation
+    output_path = os.environ.get("DKVT_TEST_OUTPUT", "./dkvt-prd2048-sample.txt")
+    try:
+        with open(output_path, "w", encoding="utf-8") as out_f:
+            out_f.write(full_text)
+        print(f"\n[Info] Output successfully archived to {output_path}")
+    except Exception as e:
+        print(f"\n[Error] Failed to archive output: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
