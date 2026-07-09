@@ -48,54 +48,67 @@ bool llama_kv_cache::transcode_to_tg_cuda_k(const char * k_src_base, char * k_ds
         const char * src = k_src_base + layers[i].k_offset_pp;
         char * dst = k_dst_base + layers[i].k_offset_tg;
 
+        int64_t n_stream = layers[i].k->ne[2];
+        int64_t n_ctx_seq = layers[i].k->ne[1];
+        int64_t src_row_stride = layers[i].k->nb[1];
+        int64_t src_stream_stride = layers[i].k->nb[2];
+
         if (is_transcodable_type(layers[i].orig_type_k)) {
-            int64_t src_row_stride = ggml_row_size(layers[i].orig_type_k, layers[i].k->ne[0]);
             int64_t dst_row_stride = ggml_row_size(dkvt_tg_type_k(layers[i].orig_type_k), layers[i].k->ne[0]);
+            int64_t dst_stream_stride = n_ctx_seq * dst_row_stride;
+
             if ((size_t) src_row_stride > scratch_cap) {
                 LLAMA_LOG_ERROR("llama_kv_cache: K row scratch overflow %zu > %zu\n",
                                 (size_t) src_row_stride, scratch_cap);
                 return false;
             }
 
-            int64_t n_stream = layers[i].k->ne[2];
-            int64_t total_rows = n_kv * n_stream;
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t cell = 0; cell < n_kv; ++cell) {
+                    const char * src_row = src + s * src_stream_stride + cell * src_row_stride;
+                    char * dst_row = dst + s * dst_stream_stride + cell * dst_row_stride;
 
-            for (int64_t row = 0; row < total_rows; ++row) {
-                const char * src_row = src + row * src_row_stride;
-                char * dst_row = dst + row * dst_row_stride;
-                ggml_cuda_device_to_device_copy_async(
-                    k_row_scratch, src_row, (size_t) src_row_stride, stream);
-                cudaError_t err = cudaGetLastError();
-                if (err != cudaSuccess) {
-                    LLAMA_LOG_ERROR(
-                        "llama_kv_cache: K D2D copy failed layer %zu row %ld: %s\n",
-                        i, (long) row, cudaGetErrorString(err));
-                    return false;
-                }
-                ggml_cuda_transcode_k_row(
-                    k_row_scratch, dst_row,
-                    layers[i].k->ne[0],
-                    src_row_stride, dst_row_stride,
-                    (int) layers[i].orig_type_k, stream);
-                err = cudaGetLastError();
-                if (err != cudaSuccess) {
-                    LLAMA_LOG_ERROR(
-                        "llama_kv_cache: K transcode kernel launch failed layer %zu row %ld: %s\n",
-                        i, (long) row, cudaGetErrorString(err));
-                    return false;
-                }
-                err = cudaStreamSynchronize(custream);
-                if (err != cudaSuccess) {
-                    LLAMA_LOG_ERROR(
-                        "llama_kv_cache: K transcode sync failed layer %zu row %ld: %s\n",
-                        i, (long) row, cudaGetErrorString(err));
-                    return false;
+                    ggml_cuda_device_to_device_copy_async(
+                        k_row_scratch, src_row, (size_t) src_row_stride, stream);
+                    cudaError_t err = cudaGetLastError();
+                    if (err != cudaSuccess) {
+                        LLAMA_LOG_ERROR(
+                            "llama_kv_cache: K D2D copy failed layer %zu stream %ld cell %ld: %s\n",
+                            i, (long) s, (long) cell, cudaGetErrorString(err));
+                        return false;
+                    }
+                    ggml_cuda_transcode_k_row(
+                        k_row_scratch, dst_row,
+                        layers[i].k->ne[0],
+                        src_row_stride, dst_row_stride,
+                        (int) layers[i].orig_type_k, stream);
+                    err = cudaGetLastError();
+                    if (err != cudaSuccess) {
+                        LLAMA_LOG_ERROR(
+                            "llama_kv_cache: K transcode kernel launch failed layer %zu stream %ld cell %ld: %s\n",
+                            i, (long) s, (long) cell, cudaGetErrorString(err));
+                        return false;
+                    }
                 }
             }
         } else {
-            size_t copy_size = ggml_row_size(layers[i].orig_type_k, layers[i].k->ne[0]) * n_kv
-                * (size_t) layers[i].k->ne[2];
-            ggml_cuda_device_to_device_copy_async(dst, src, copy_size, stream);
+            int64_t dst_row_stride = src_row_stride;
+            int64_t dst_stream_stride = src_stream_stride;
+
+            for (int64_t s = 0; s < n_stream; ++s) {
+                const char * src_stream = src + s * src_stream_stride;
+                char * dst_stream = dst + s * dst_stream_stride;
+                size_t copy_size = (size_t) src_row_stride * n_kv;
+
+                ggml_cuda_device_to_device_copy_async(dst_stream, src_stream, copy_size, stream);
+                cudaError_t err = cudaGetLastError();
+                if (err != cudaSuccess) {
+                    LLAMA_LOG_ERROR(
+                        "llama_kv_cache: K direct D2D copy failed layer %zu stream %ld: %s\n",
+                        i, (long) s, cudaGetErrorString(err));
+                    return false;
+                }
+            }
         }
     }
     return true;
@@ -120,50 +133,66 @@ bool llama_kv_cache::transcode_to_tg_cuda_v(const char * v_src_base, char * v_ds
 
         const char * src = v_src_base + layers[i].v_offset_pp;
         char * dst = v_dst_base + layers[i].v_offset_tg;
+
         int64_t head_size_v = v_trans ? layers[i].v->ne[1] : layers[i].v->ne[0];
-        int64_t src_row_stride = ggml_row_size(layers[i].orig_type_v, head_size_v);
+        int64_t src_row_stride = layers[i].v->nb[1];
+        int64_t src_stream_stride = layers[i].v->nb[2];
+
         int64_t dst_row_stride = ggml_row_size(dkvt_tg_type_v(layers[i].orig_type_v), head_size_v);
         int64_t n_stream = layers[i].v->ne[2];
-        int64_t total_rows = n_kv * n_stream;
+        int64_t n_ctx_seq = v_trans ? layers[i].v->ne[0] : layers[i].v->ne[1];
+        int64_t dst_stream_stride = n_ctx_seq * dst_row_stride;
 
         if (is_transcodable_type(layers[i].orig_type_v)) {
             if ((size_t) src_row_stride > scratch_cap) {
                 LLAMA_LOG_ERROR("llama_kv_cache: V row scratch overflow\n");
                 return false;
             }
-            for (int64_t row = 0; row < total_rows; ++row) {
-                const char * src_row = src + row * src_row_stride;
-                char * dst_row = dst + row * dst_row_stride;
-                ggml_cuda_device_to_device_copy_async(
-                    v_row_scratch, src_row, (size_t) src_row_stride, stream);
-                cudaError_t err = cudaGetLastError();
-                if (err != cudaSuccess) {
-                    LLAMA_LOG_ERROR(
-                        "llama_kv_cache: V D2D copy failed layer %zu row %ld: %s\n",
-                        i, (long) row, cudaGetErrorString(err));
-                    return false;
-                }
-                ggml_cuda_transcode_v_row(
-                    v_row_scratch, dst_row, head_size_v,
-                    src_row_stride, dst_row_stride,
-                    (int) layers[i].orig_type_v, stream);
-                err = cudaGetLastError();
-                if (err != cudaSuccess) {
-                    LLAMA_LOG_ERROR(
-                        "llama_kv_cache: V transcode kernel launch failed layer %zu row %ld: %s\n",
-                        i, (long) row, cudaGetErrorString(err));
-                    return false;
-                }
-                err = cudaStreamSynchronize(custream);
-                if (err != cudaSuccess) {
-                    LLAMA_LOG_ERROR("llama_kv_cache: V transcode sync layer %zu row %ld: %s\n",
-                                    i, (long) row, cudaGetErrorString(err));
-                    return false;
+            for (int64_t s = 0; s < n_stream; ++s) {
+                for (int64_t cell = 0; cell < n_kv; ++cell) {
+                    const char * src_row = src + s * src_stream_stride + cell * src_row_stride;
+                    char * dst_row = dst + s * dst_stream_stride + cell * dst_row_stride;
+
+                    ggml_cuda_device_to_device_copy_async(
+                        v_row_scratch, src_row, (size_t) src_row_stride, stream);
+                    cudaError_t err = cudaGetLastError();
+                    if (err != cudaSuccess) {
+                        LLAMA_LOG_ERROR(
+                            "llama_kv_cache: V D2D copy failed layer %zu stream %ld cell %ld: %s\n",
+                            i, (long) s, (long) cell, cudaGetErrorString(err));
+                        return false;
+                    }
+                    ggml_cuda_transcode_v_row(
+                        v_row_scratch, dst_row, head_size_v,
+                        src_row_stride, dst_row_stride,
+                        (int) layers[i].orig_type_v, stream);
+                    err = cudaGetLastError();
+                    if (err != cudaSuccess) {
+                        LLAMA_LOG_ERROR(
+                            "llama_kv_cache: V transcode kernel launch failed layer %zu stream %ld cell %ld: %s\n",
+                            i, (long) s, (long) cell, cudaGetErrorString(err));
+                        return false;
+                    }
                 }
             }
         } else {
-            size_t copy_size = (size_t) src_row_stride * (size_t) total_rows;
-            ggml_cuda_device_to_device_copy_async(dst, src, copy_size, stream);
+            int64_t dst_row_stride = src_row_stride;
+            int64_t dst_stream_stride = src_stream_stride;
+
+            for (int64_t s = 0; s < n_stream; ++s) {
+                const char * src_stream = src + s * src_stream_stride;
+                char * dst_stream = dst + s * dst_stream_stride;
+                size_t copy_size = (size_t) src_row_stride * n_kv;
+
+                ggml_cuda_device_to_device_copy_async(dst_stream, src_stream, copy_size, stream);
+                cudaError_t err = cudaGetLastError();
+                if (err != cudaSuccess) {
+                    LLAMA_LOG_ERROR(
+                        "llama_kv_cache: V direct D2D copy failed layer %zu stream %ld: %s\n",
+                        i, (long) s, cudaGetErrorString(err));
+                    return false;
+                }
+            }
         }
     }
     return true;
