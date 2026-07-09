@@ -496,14 +496,29 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
-        // TODO: this logic incorrectly assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are
-        //       inside the same ubatch. currently with `split_equal()` this is not correct
-
+        // Fix: shift older slots in the recurrent cache before writing new ones
+        const int64_t n_tokens_all = conv_input->ne[0];
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
+        if (n_tokens_all < K) {
+            for (int64_t s = K - 1; s >= n_tokens_all; --s) {
+                ggml_tensor * src_slot = ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs, conv_states_all->nb[1],
+                    ((s - n_tokens_all) * (size_t) mem_size + kv_head) * row_size);
+
+                ggml_tensor * dst_slot = ggml_view_2d(ctx0, conv_states_all,
+                    row_count, n_seqs, conv_states_all->nb[1],
+                    (s * (size_t) mem_size + kv_head) * row_size);
+
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_slot, dst_slot));
+            }
+        }
+
+        const int64_t n_written = std::min<int64_t>(n_tokens_all, K);
+
+        for (int64_t t = 1; t <= n_written; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - n_written + t);
+            const int64_t s_slot = n_written - t;
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
@@ -515,7 +530,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 ggml_view_2d(ctx0,
                         conv_states_all, row_count, n_seqs,
                         conv_states_all->nb[1],
-                        (s_slot * mem_size + kv_head) * row_size);
+                        (s_slot * (size_t) mem_size + kv_head) * row_size);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
         }
@@ -583,6 +598,25 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     cb(output, "attn_output", il);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+    // Shift the older snapshots in the recurrent cache first
+    if (n_seq_tokens < K) {
+        for (int64_t s = K - 1; s >= n_seq_tokens; --s) {
+            ggml_tensor * src_slot = ggml_view_3d(ctx0, ssm_states_all,
+                D, n_seqs, 1,
+                ssm_states_all->nb[1],
+                (size_t) mem_size * row_size,
+                ((s - n_seq_tokens) * (size_t) mem_size + kv_head) * row_size);
+
+            ggml_tensor * dst_slot = ggml_view_3d(ctx0, ssm_states_all,
+                D, n_seqs, 1,
+                ssm_states_all->nb[1],
+                (size_t) mem_size * row_size,
+                (s * (size_t) mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src_slot, dst_slot));
+        }
+    }
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
