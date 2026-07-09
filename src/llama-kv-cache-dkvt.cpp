@@ -189,6 +189,15 @@ bool llama_kv_cache::init_dkvt_alloc(ggml_backend_buffer_type_t buft) {
 }
 
 void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
+    // Short-circuit for MTP companion context (which only has 1 layer, e.g. blk.40).
+    // Speculative draft layers do not need complex dynamic KV transcoding (DKVT)
+    // as their VRAM footprint is negligible (~18 MB). Keeping them in their original
+    // format avoids all multi-context synchronization and format-mismatch bugs.
+    if (layers.size() <= 1) {
+        disable_dkvt_ext_flags();
+        return;
+    }
+
     if (disable_dkvt) {
         disable_dkvt_ext_flags();
         return;
