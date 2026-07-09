@@ -33,6 +33,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
+    LLAMA_LOG_WARN("llama_memory_recurrent: constructor: n_seq_max=%u, n_rs_seq=%u\n", n_seq_max, n_rs_seq);
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
@@ -1254,11 +1255,15 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
 
     uint32_t idx = 0;
-    if (!mem->cells[cell_idx].seq_id.empty()) {
-        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
-        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
-            idx = mem->rs_idx[seq];
-            // Do NOT reset here! It will be reset in the destructor after the entire graph has finished building.
+    // Get the sequence ID directly from the current ubatch instead of cells (which might be empty due to rollback)
+    if (!ubatches.empty() && i_next < ubatches.size()) {
+        const auto & ubatch = ubatches[i_next];
+        const uint32_t tok_idx = i * ubatch.n_seq_tokens;
+        if (tok_idx < ubatch.n_tokens && ubatch.n_seq_id[tok_idx] > 0) {
+            const llama_seq_id seq = ubatch.seq_id[tok_idx][0];
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+                idx = mem->rs_idx[seq];
+            }
         }
     }
     return (int32_t)(idx * mem->size) + src0;
