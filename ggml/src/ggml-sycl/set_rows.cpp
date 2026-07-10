@@ -123,7 +123,7 @@ static void set_rows_sycl_turbo3(ggml_backend_sycl_context & ctx,
 
         cgh.parallel_for(
             sycl::nd_range<1>(n_groups * 128, 128),
-            [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 const int j = item.get_local_id(0);
                 const int64_t g = item.get_group(0);
                 auto sg = item.get_sub_group();
@@ -244,7 +244,7 @@ static void set_rows_sycl_turbo4(ggml_backend_sycl_context & ctx,
 
         cgh.parallel_for(
             sycl::nd_range<1>(n_groups * 128, 128),
-            [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 const int j = item.get_local_id(0);
                 const int64_t g = item.get_group(0);
                 auto sg = item.get_sub_group();
@@ -358,7 +358,7 @@ static void set_rows_sycl_turbo2(ggml_backend_sycl_context & ctx,
 
         cgh.parallel_for(
             sycl::nd_range<1>(n_groups * 128, 128),
-            [=](sycl::nd_item<1> item) [[intel::reqd_sub_group_size(WARP_SIZE)]] {
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 const int j = item.get_local_id(0);
                 const int64_t g = item.get_group(0);
                 auto sg = item.get_sub_group();

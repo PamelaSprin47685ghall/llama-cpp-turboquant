@@ -16,6 +16,10 @@
 #include "common.hpp"
 #include "../ggml-common.h"
 
+#if !TURBO4_USE_4BIT
+#error "SYCL TurboQuant currently assumes TURBO4_USE_4BIT=1 (4-bit PolarQuant turbo4_0 layout)"
+#endif
+
 // ---- 2-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
 constexpr float TURBO_CENTROIDS_2BIT[4] = {
