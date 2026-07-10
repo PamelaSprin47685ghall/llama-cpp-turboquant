@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cmath>
 #include <float.h>
+#include <type_traits>
 
 
 #define FATTN_KQ_STRIDE       256
