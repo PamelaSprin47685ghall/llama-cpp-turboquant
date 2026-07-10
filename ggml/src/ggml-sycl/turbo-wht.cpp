@@ -7,6 +7,8 @@
  * InnerQ scale_inv: wired up but always identity on SYCL - calibration is CUDA-only (llama-kv-cache.cpp, #ifdef GGML_USE_CUDA).
  */
 
+#include <cstring>
+
 #include "turbo-wht.hpp"
 #include "turbo-quant.hpp"
 
