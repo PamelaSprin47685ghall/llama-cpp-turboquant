@@ -54,9 +54,9 @@ void llama_kv_cache::init_dkvt_bind_layers(ggml_backend_sched_t sched, int buffe
 }
 
 void llama_kv_cache::dkvt_apply_union_compute_cap(ggml_backend_sched_t sched) const {
-    if (other) {
-        size_act_pp = other->size_act_pp;
-        size_act_tg = other->size_act_tg;
+    if (dkvt_parent) {
+        size_act_pp = dkvt_parent->size_act_pp;
+        size_act_tg = dkvt_parent->size_act_tg;
     }
     if (!sched || dkvt_sched_buffer_id < 0) return;
     size_t kv_total_tg = dkvt_v_size_tg + dkvt_k_size_tg;
@@ -207,7 +207,7 @@ void llama_kv_cache::transcode_to_tg(void * stream) {
     }
 
     if (!vram_union_block || !ptr_start) {
-        if (other) {
+        if (dkvt_parent) {
             return;
         }
         throw std::runtime_error("DKVT transcode required but union buffer is not initialized");
@@ -215,14 +215,14 @@ void llama_kv_cache::transcode_to_tg(void * stream) {
 
     // 伴生上下文转码：伴生上下文有自己独立的层（如 MTP 层），
     // 必须执行自己的转码内核，不能仅复用主上下文的绑定。
-    if (other) {
-        if (other->is_transcoded_tg && !is_transcoded_tg) {
+    if (dkvt_parent) {
+        if (dkvt_parent->is_transcoded_tg && !is_transcoded_tg) {
             // Check if companion has its own transcodable layers with data
             bool has_own_transcodable = false;
             for (size_t i = 0; i < layers.size(); ++i) {
                 // Only transcode layers that are NOT shared with parent (no matching il in parent)
                 int32_t il = layers[i].il;
-                if (other->map_layer_ids.count(il) == 0) {
+                if (dkvt_parent->map_layer_ids.count(il) == 0) {
                     if ((layers[i].k && is_transcodable_type(layers[i].orig_type_k) && (layers[i].k->flags & GGML_TENSOR_FLAG_EXT)) ||
                         (layers[i].v && is_transcodable_type(layers[i].orig_type_v) && (layers[i].v->flags & GGML_TENSOR_FLAG_EXT))) {
                         has_own_transcodable = true;

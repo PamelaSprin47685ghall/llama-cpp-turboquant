@@ -97,34 +97,34 @@ void llama_kv_cache::init_dkvt_borrow() {
     if (!has_transcodable) {
         return;
     }
-    GGML_ASSERT(other->vram_union_block != nullptr && "Main context must be initialized before draft context (main-first).");
+    GGML_ASSERT(dkvt_parent->vram_union_block != nullptr && "Main context must be initialized before draft context (main-first).");
 
-    vram_union_block = other->vram_union_block;
-    ptr_start = other->ptr_start;
-    ptr_end = other->ptr_end;
-    union_size = other->union_size;
-    dkvt_k_size_pp = other->dkvt_k_size_pp;
-    dkvt_k_size_tg = other->dkvt_k_size_tg;
-    dkvt_v_size_pp = other->dkvt_v_size_pp;
-    dkvt_v_size_tg = other->dkvt_v_size_tg;
-    is_transcoded_tg = other->is_transcoded_tg;
-    size_act_pp = other->size_act_pp;
-    size_act_tg = other->size_act_tg;
-    dkvt_sched_buffer_id = other->dkvt_sched_buffer_id;
+    vram_union_block = dkvt_parent->vram_union_block;
+    ptr_start = dkvt_parent->ptr_start;
+    ptr_end = dkvt_parent->ptr_end;
+    union_size = dkvt_parent->union_size;
+    dkvt_k_size_pp = dkvt_parent->dkvt_k_size_pp;
+    dkvt_k_size_tg = dkvt_parent->dkvt_k_size_tg;
+    dkvt_v_size_pp = dkvt_parent->dkvt_v_size_pp;
+    dkvt_v_size_tg = dkvt_parent->dkvt_v_size_tg;
+    is_transcoded_tg = dkvt_parent->is_transcoded_tg;
+    size_act_pp = dkvt_parent->size_act_pp;
+    size_act_tg = dkvt_parent->size_act_tg;
+    dkvt_sched_buffer_id = dkvt_parent->dkvt_sched_buffer_id;
 
     // 逐层同步偏移和尺寸，确保伴生上下文与主上下文共享层布局完全一致。
     for (size_t i = 0; i < layers.size(); ++i) {
         int32_t il = layers[i].il;
-        if (other->map_layer_ids.count(il) > 0) {
-            int32_t other_i = other->map_layer_ids.at(il);
-            layers[i].k_offset_pp = other->layers[other_i].k_offset_pp;
-            layers[i].k_offset_tg = other->layers[other_i].k_offset_tg;
-            layers[i].v_offset_pp = other->layers[other_i].v_offset_pp;
-            layers[i].v_offset_tg = other->layers[other_i].v_offset_tg;
-            layers[i].k_size_pp   = other->layers[other_i].k_size_pp;
-            layers[i].k_size_tg   = other->layers[other_i].k_size_tg;
-            layers[i].v_size_pp   = other->layers[other_i].v_size_pp;
-            layers[i].v_size_tg   = other->layers[other_i].v_size_tg;
+        if (dkvt_parent->map_layer_ids.count(il) > 0) {
+            int32_t other_i = dkvt_parent->map_layer_ids.at(il);
+            layers[i].k_offset_pp = dkvt_parent->layers[other_i].k_offset_pp;
+            layers[i].k_offset_tg = dkvt_parent->layers[other_i].k_offset_tg;
+            layers[i].v_offset_pp = dkvt_parent->layers[other_i].v_offset_pp;
+            layers[i].v_offset_tg = dkvt_parent->layers[other_i].v_offset_tg;
+            layers[i].k_size_pp   = dkvt_parent->layers[other_i].k_size_pp;
+            layers[i].k_size_tg   = dkvt_parent->layers[other_i].k_size_tg;
+            layers[i].v_size_pp   = dkvt_parent->layers[other_i].v_size_pp;
+            layers[i].v_size_tg   = dkvt_parent->layers[other_i].v_size_tg;
         } else {
             // Independent layer: clear EXT flag so allocator will allocate it
             if (layers[i].k) {
@@ -195,6 +195,20 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
     // format avoids all multi-context synchronization and format-mismatch bugs.
     if (layers.size() <= 1) {
         disable_dkvt_ext_flags();
+        // Even without transcodable layers, the companion context's scheduler
+        // must inherit the parent's base_offset/cap so graph allocations land
+        // in the correct region of the union buffer.
+        if (dkvt_parent && dkvt_parent->get_dkvt_active()) {
+            vram_union_block     = dkvt_parent->vram_union_block;
+            dkvt_sched_buffer_id = dkvt_parent->dkvt_sched_buffer_id;
+            is_transcoded_tg     = dkvt_parent->is_transcoded_tg;
+            dkvt_v_size_tg       = dkvt_parent->dkvt_v_size_tg;
+            dkvt_k_size_tg       = dkvt_parent->dkvt_k_size_tg;
+            size_act_pp          = dkvt_parent->size_act_pp;
+            size_act_tg          = dkvt_parent->size_act_tg;
+            dkvt_sched           = sched;
+            dkvt_apply_union_compute_cap(sched);
+        }
         return;
     }
 
@@ -204,7 +218,7 @@ void llama_kv_cache::init_dkvt(size_t n_ubatch, ggml_backend_sched_t sched) {
     }
     LLAMA_LOG_WARN("llama_kv_cache: init_dkvt: other=%p, layers=%zu, n_seq_max=%u, is_transcoded_tg=%d\n", (void*)other, layers.size(), n_seq_max, (int)is_transcoded_tg);
     dkvt_sched = sched;
-    if (other) {
+    if (dkvt_parent) {
         // init_dkvt_borrow() syncs is_transcoded_tg from parent and
         // rebinds shared layer pointers to match parent's current layout (PP or TG).
         // This is called on every process_ubatch, so companion stays in sync

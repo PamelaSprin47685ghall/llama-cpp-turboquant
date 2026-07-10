@@ -132,6 +132,7 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(hparams), v_trans(v_trans), orig_v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(mem_other ? mem_other->as_kv_cache() : nullptr),
+    dkvt_parent(other),
     v_cells_impl(std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl),
     is_transcoded_tg(false), is_mtp(is_mtp), disable_dkvt(disable_dkvt) {

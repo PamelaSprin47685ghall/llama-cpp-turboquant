@@ -11,9 +11,9 @@ import:
 
 ## 核心量化配置
 
-### 1. 权重配置：Q6_K All the Way
-- **方案**：GPU侧与CPU侧权重统一使用原生的Q6_K量化模型。
-- **依据**：避免混合精度带来的多算子切换和运行时解包耗时。Q6_K（6.5 bpw）相比于 4bit 量化，大幅提升模型精度和输出稳定性，且在 GPU 加速下，解包与算力开销平衡性最佳。4060 支持 INT8 MMA，使用原生 Q6_K 可在 Prefill 阶段充分利用 GPU Tensor Core 加速。
+### 1. 权重配置：混合重要性量化（IQ4_NL + Q6_K）
+- **方案**：主模型的 MoE 专家层（CPU 侧计算）使用基于重要性矩阵的 **`IQ4_NL`** 量化权重；非 MoE 层 / Attention 层 / SSM 循环层（GPU 显存内计算）采用原生的 **`Q6_K`** 格式以防止数值发散。
+- **依据**：MoE 专家层体积庞大（占 85% 权重），通过 IQ4_NL 可极大地缩减模型总体积（从 27.19 GiB 压缩至 18.68 GiB），有效减轻了 CPU 内存带宽瓶颈和显存消耗。而非 MoE 层保留在 Q6_K 以保证循环隐状态（recurrent state）的数值稳定性。
 
 ### 2. KV Cache配置：Turbo Quant
 - **方案**：启用低比特 KV Cache，推荐参数：
@@ -42,12 +42,12 @@ import:
 
 在启用以上补丁及黄金调优参数下，Ornith 35B 在本机单 GPU (RTX 4060) + CPU 混合平台取得了极佳的性能表现：
 
-* **Prompt Prefill Speed**: **718.1 t/s** (91KB 大文本，在 `-b 3072` 下测得) / **50.1 t/s ~ 55.9 t/s** (16 tokens 短文本)
-* **Token Generation Speed**: **28.9 t/s ~ 49.8 t/s** (256k 核心上下文 28.9 t/s，短序列投机解码 49.8 t/s)
+* **Prompt Prefill Speed**: **862.89 t/s** (大文本) / **50.1 t/s ~ 55.9 t/s** (16 tokens 短文本)
+* **Token Generation Speed**: **22.39 t/s** (无投机基准) / **28.76 t/s ~ 38.01 t/s** (MTP 投机解码下测得，8K 短文本加速至 38.01 t/s)
 * **MTP 投机接受率 (Draft Acceptance Rate)**:
-  * 短文本会话：**95.83%** (接受 46 / 48 tokens)
-  * 长文本连续推理压力测试：**74.89%** (接受 176 / 235 tokens)
-* **显存状况**: 双图完全共享 compute 缓冲区（~441 MiB），无二次重分配 OOM，长文本连续解码状态稳定。
+  * 整体测试：**63.3%** (326 accepted / 515 generated)
+* **净加速比**: 实现了 **1.214x ~ 1.30x** 的净吞吐加速（在 CPU 专家层 offload 极高延迟惩罚下取得显著性能优势）。
+* **显存状况**: 双图完全共享 compute 缓冲区，无二次重分配 OOM，长文本连续解码状态稳定。
 
 ---
 
@@ -79,7 +79,7 @@ import:
 export LD_LIBRARY_PATH=/home/kunweiz/Desktop/Ornith/llama-cpp-turboquant/build/bin
 
 numactl --interleave=all taskset -c 0-15 ./build/bin/llama-cli \
-    -m /home/kunweiz/Desktop/Ornith/weights/ornith-1.0-35b-Q6_K-MTP-final.gguf \
+    -m /home/kunweiz/Desktop/Ornith/weights/ornith-1.0-35b-IQ4NL-MTP-final.gguf \
     -ngl 999 \
     -ot "exps=CPU" \
     --cache-type-k turbo4 \
@@ -87,14 +87,14 @@ numactl --interleave=all taskset -c 0-15 ./build/bin/llama-cli \
     -fa on \
     -b 3072 \
     -ub 3072 \
-    -t 16 \
-    -tb 16 \
+    -t 8 \
+    -tb 8 \
     -c 256000 \
     --numa numactl \
     --spec-type draft-mtp \
-    --spec-draft-n-max 3 \
-    --spec-draft-p-min 0.0 \
-    --spec-draft-n-min 0 \
+    --spec-draft-n-max 2 \
+    --spec-draft-p-min 0.16 \
+    --spec-draft-n-min 2 \
     --spec-draft-type-k turbo4 \
     --spec-draft-type-v turbo2 \
     -st
@@ -109,12 +109,12 @@ set -euo pipefail
 DIR="/home/kunweiz/Desktop/Ornith/llama-cpp-turboquant"
 PORT="${PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
-THREADS="${THREADS:-16}"
+THREADS="${THREADS:-8}"
 BATCH="${BATCH:-3072}"
 UBATCH="${UBATCH:-3072}"
 CORES="${CORES:-0-15}"
 CTX_SIZE="${CTX_SIZE:-256000}" # 256k 核心大上下文
-MODEL="${MODEL:-/home/kunweiz/Desktop/Ornith/weights/ornith-1.0-35b-Q6_K-MTP-final.gguf}"
+MODEL="${MODEL:-/home/kunweiz/Desktop/Ornith/weights/ornith-1.0-35b-IQ4NL-MTP-final.gguf}"
 
 export LD_LIBRARY_PATH="${DIR}/build/bin:${LD_LIBRARY_PATH:-}"
 
@@ -180,9 +180,9 @@ numactl --interleave=all taskset -c "${CORES}" "${DIR}/build/bin/llama-server" \
     -tb "${THREADS}" \
     --numa numactl \
     --spec-type draft-mtp \
-    --spec-draft-n-max 3 \
-    --spec-draft-p-min 0.0 \
-    --spec-draft-n-min 0 \
+    --spec-draft-n-max 2 \
+    --spec-draft-p-min 0.16 \
+    --spec-draft-n-min 2 \
     --spec-draft-type-k turbo4 \
     --spec-draft-type-v turbo2
 ```

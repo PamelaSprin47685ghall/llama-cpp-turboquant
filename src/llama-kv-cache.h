@@ -308,6 +308,7 @@ private:
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
+    llama_kv_cache * dkvt_parent = nullptr; // preserved parent for DKVT borrow after other is cleared (MTP)
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 

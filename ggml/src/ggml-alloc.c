@@ -1354,5 +1354,14 @@ void ggml_gallocr_set_borrowed_compute_cap(ggml_gallocr_t galloc, int buffer_id,
 
 void ggml_gallocr_set_borrowed_compute_base_offset(ggml_gallocr_t galloc, int buffer_id, size_t base_offset) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
-    ggml_dyn_tallocr_set_base_offset(galloc->buf_tallocs[buffer_id], base_offset);
+    struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
+    // If base_offset changes, invalidate cached allocation state so that
+    // ggml_gallocr_alloc_graph will re-allocate graph activations with the
+    // new offset. Without this, only cap changes trigger realloc checks,
+    // and base_offset changes would silently compute at wrong addresses.
+    if (alloc->base_offset != base_offset) {
+        alloc->base_offset = base_offset;
+        galloc->n_nodes = 0;
+        galloc->n_leafs = 0;
+    }
 }

@@ -204,6 +204,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-dkvt-companion-more PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-dkvt-companion-more2.cpp)
     target_include_directories(test-dkvt-companion-more2 PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-dkvt-companion-offset.cpp)
+    target_include_directories(test-dkvt-companion-offset PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
