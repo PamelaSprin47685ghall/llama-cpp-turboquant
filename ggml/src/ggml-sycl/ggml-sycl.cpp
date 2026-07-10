@@ -5557,11 +5557,14 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_sycl_flash_attn_ext_supported(device, op);
         case GGML_OP_TURBO_WHT:
             {
+                const ggml_tensor * scale = op->src[1];
                 int group_size = 0;
                 memcpy(&group_size, op->op_params + sizeof(int), sizeof(int));
                 return op->src[0]->type == GGML_TYPE_F32
                     && op->type == GGML_TYPE_F32
                     && ggml_is_contiguous(op->src[0])
+                    && ggml_is_contiguous(op)
+                    && (scale == nullptr || (scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale)))
                     && (group_size == 128 || group_size == 64);
             }
         default:

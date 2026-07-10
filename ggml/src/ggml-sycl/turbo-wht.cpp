@@ -162,16 +162,20 @@ void ggml_sycl_turbo_wht(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     memcpy(&direction,  dst->op_params + 0,            sizeof(int));
     memcpy(&group_size, dst->op_params + sizeof(int),  sizeof(int));
 
+    GGML_ASSERT(direction == 0 || direction == 1);
+
     const int64_t head_dim = src->ne[0];
     GGML_ASSERT(head_dim > 0);
     GGML_ASSERT(group_size == 64 || group_size == 128);
     GGML_ASSERT(head_dim % group_size == 0 || head_dim > group_size);
 
     const ggml_tensor * scale_tensor = dst->src[1];
-    const float * scale_inv_ptr = scale_tensor ? (const float *) scale_tensor->data : nullptr;
-    if (scale_inv_ptr != nullptr) {
+    if (scale_tensor) {
+        GGML_ASSERT(scale_tensor->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(scale_tensor));
         GGML_ASSERT(scale_tensor->ne[0] >= group_size);
     }
+    const float * scale_inv_ptr = scale_tensor ? (const float *) scale_tensor->data : nullptr;
 
     const int64_t n_heads         = ggml_nelements(src) / head_dim;
     const int64_t groups_per_head = head_dim / group_size;
